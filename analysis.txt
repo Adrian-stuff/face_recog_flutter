@@ -1,0 +1,7 @@
+Analyzing mobile_app...                                         
+
+  error - The getter 'first' isn't defined for the type 'ConnectivityResult' - lib\services\network_service.dart:10:120 - undefined_getter
+   info - Don't invoke 'print' in production code - lib\services\network_service.dart:37:7 - avoid_print
+   info - Parameter 'key' could be a super parameter - lib\widgets\network_guard.dart:10:9 - use_super_parameters
+   info - Invalid use of a private type in a public API - lib\widgets\network_guard.dart:13:3 - library_private_types_in_public_api
+

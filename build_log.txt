@@ -1,0 +1,43 @@
+Resolving dependencies...
+Downloading packages...
+  app_links 6.4.1 (7.0.0 available)
+  connectivity_plus 5.0.2 (7.0.0 available)
+  connectivity_plus_platform_interface 1.2.4 (2.0.1 available)
+  google_mlkit_commons 0.9.0 (0.11.1 available)
+  google_mlkit_face_detection 0.12.0 (0.13.2 available)
+  js 0.6.7 (0.7.2 available)
+  meta 1.17.0 (1.18.1 available)
+  network_info_plus 5.0.3 (7.0.0 available)
+  permission_handler 11.4.0 (12.0.1 available)
+  permission_handler_android 12.1.0 (13.0.1 available)
+  test_api 0.7.8 (0.7.9 available)
+Got dependencies!
+11 packages have newer versions incompatible with dependency constraints.
+Try `flutter pub outdated` for more information.
+Running Gradle task 'assembleDebug'...                          
+warning: [options] source value 8 is obsolete and will be removed in a future release
+warning: [options] target value 8 is obsolete and will be removed in a future release
+warning: [options] To suppress warnings about obsolete options, use -Xlint:-options.
+3 warnings
+warning: [options] source value 8 is obsolete and will be removed in a future release
+warning: [options] target value 8 is obsolete and will be removed in a future release
+warning: [options] To suppress warnings about obsolete options, use -Xlint:-options.
+3 warnings
+warning: [options] source value 8 is obsolete and will be removed in a future release
+warning: [options] target value 8 is obsolete and will be removed in a future release
+warning: [options] To suppress warnings about obsolete options, use -Xlint:-options.
+Note: C:\Users\Adrian\AppData\Local\Pub\Cache\hosted\pub.dev\google_mlkit_face_detection-0.12.0\android\src\main\java\com\google_mlkit_face_detection\FaceDetector.java uses unchecked or unsafe operations.
+Note: Recompile with -Xlint:unchecked for details.
+3 warnings
+warning: [options] source value 8 is obsolete and will be removed in a future release
+warning: [options] target value 8 is obsolete and will be removed in a future release
+warning: [options] To suppress warnings about obsolete options, use -Xlint:-options.
+3 warnings
+warning: [options] source value 8 is obsolete and will be removed in a future release
+warning: [options] target value 8 is obsolete and will be removed in a future release
+warning: [options] To suppress warnings about obsolete options, use -Xlint:-options.
+Note: C:\Users\Adrian\projects\face_recognition_payroll_system\mobile_app\packages\tflite_flutter\android\src\main\java\com\tfliteflutter\tflite_flutter_plugin\TfliteFlutterPlugin.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+3 warnings
+Running Gradle task 'assembleDebug'...                            355.5s
+Γ£ô Built build\app\outputs\flutter-apk\app-debug.apk

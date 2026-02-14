@@ -1,0 +1,319 @@
+import 'dart:io';
+import 'package:flutter/foundation.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import 'dart:math';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'local_database_service.dart';
+
+class SupabaseService {
+  static final SupabaseService _instance = SupabaseService._internal();
+  factory SupabaseService() => _instance;
+  SupabaseService._internal();
+
+  final SupabaseClient _client = Supabase.instance.client;
+  final LocalDatabaseService _localDb = LocalDatabaseService();
+
+  /// Check internet connectivity
+  Future<bool> get isOnline async {
+    final connectivityResult = await Connectivity().checkConnectivity();
+    return connectivityResult != ConnectivityResult.none;
+  }
+
+  // --- Synchronization ---
+
+  /// Syncs employees from Supabase to Local DB (Down Sync)
+  Future<void> syncEmployees() async {
+    if (!await isOnline) return;
+
+    try {
+      // Fetch employees AND their face encodings
+      final employees = await _client
+          .from('employees')
+          .select(
+            'id, first_name, last_name, position, face_encodings(descriptor)',
+          );
+
+      // Transform data for local storage
+      // flatten: employee -> hasOne face_encoding -> descriptor
+      final List<Map<String, dynamic>> localData = employees.map((e) {
+        final encodings = e['face_encodings'] as List<dynamic>?;
+        String? descriptorStr;
+        if (encodings != null && encodings.isNotEmpty) {
+          descriptorStr = encodings.first['descriptor'] as String?;
+          // Ensure format is [x,y,z] not string if needed,
+          // but for now we store raw string from PGVector
+        }
+
+        return {
+          'id': e['id'],
+          'first_name': e['first_name'],
+          'last_name': e['last_name'],
+          'position': e['position'],
+          'face_features': descriptorStr, // Store vector string
+        };
+      }).toList();
+
+      await _localDb.syncEmployees(localData);
+    } catch (e) {
+      debugPrint('Sync Error: $e');
+    }
+  }
+
+  /// Syncs offline logs to Supabase (Up Sync)
+  Future<void> syncLogs() async {
+    if (!await isOnline) return;
+
+    final logs = await _localDb.getUnsyncedLogs();
+    if (logs.isEmpty) return;
+
+    for (var log in logs) {
+      try {
+        await _client.from('attendance_logs').insert({
+          'employee_id': log['employee_id'],
+          'date': (log['timestamp'] as String).split('T')[0],
+          'time': (log['timestamp'] as String).split('T')[1].substring(0, 8),
+          'type': log['type'],
+        });
+
+        // Mark as synced only if successful
+        await _localDb.markLogsAsSynced([log['id'] as int]);
+      } catch (e) {
+        debugPrint('Failed to sync log ${log['id']}: $e');
+      }
+    }
+  }
+
+  // --- Core Features ---
+
+  Future<void> saveFaceDescriptor(
+    int employeeId,
+    List<double> embedding,
+  ) async {
+    try {
+      final vectorStr = '[${embedding.join(',')}]';
+      await _client.from('face_encodings').insert({
+        'employee_id': employeeId,
+        'descriptor': vectorStr,
+      });
+    } catch (e) {
+      debugPrint('Error saving face descriptor: $e');
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>?> verifyFace(List<double> embedding) async {
+    if (await isOnline) {
+      // ONLINE: Use pgvector RPC
+      try {
+        final vectorStr = '[${embedding.join(',')}]';
+        final response = await _client.rpc(
+          'match_face',
+          params: {
+            'query_embedding': vectorStr,
+            'match_threshold': 0.7,
+            'match_count': 1,
+          },
+        );
+
+        final List<dynamic> results = response as List<dynamic>;
+        if (results.isEmpty) return null;
+
+        final match = results.first as Map<String, dynamic>;
+        return {
+          'id': match['employee_id'],
+          'first_name': match['first_name'],
+          'last_name': match['last_name'],
+          'position': match['position'],
+          'similarity': match['similarity'],
+        };
+      } catch (e) {
+        debugPrint('Online verification failed: $e');
+        // Fallback to offline if RPC fails
+      }
+    }
+
+    // OFFLINE: Local Cosine Similarity
+    debugPrint('Using Offline Verification...');
+    final employees = await _localDb.getAllEmployees();
+    double maxScore = -1.0;
+    Map<String, dynamic>? bestMatch;
+
+    for (var emp in employees) {
+      final featureStr = emp['face_features'] as String?;
+      if (featureStr == null) continue;
+
+      // Parse vector string '[0.1, 0.2, ...]'
+      final vectorList = featureStr
+          .replaceAll('[', '')
+          .replaceAll(']', '')
+          .split(',')
+          .map((e) => double.tryParse(e.trim()) ?? 0.0)
+          .toList();
+
+      if (vectorList.length != embedding.length) continue;
+
+      // Calculate Cosine Similarity
+      double dotProduct = 0.0;
+      double normA = 0.0;
+      double normB = 0.0;
+
+      for (int i = 0; i < embedding.length; i++) {
+        dotProduct += embedding[i] * vectorList[i];
+        normA += embedding[i] * embedding[i];
+        normB += vectorList[i] * vectorList[i];
+      }
+
+      final score = dotProduct / (sqrt(normA) * sqrt(normB));
+
+      if (score > maxScore) {
+        maxScore = score;
+        bestMatch = emp;
+      }
+    }
+
+    if (maxScore >= 0.7 && bestMatch != null) {
+      return {
+        'id': bestMatch['id'],
+        'first_name': bestMatch['first_name'],
+        'last_name': bestMatch['last_name'],
+        'position': bestMatch['position'],
+        'similarity': maxScore,
+      };
+    }
+
+    return null;
+  }
+
+  Future<bool> loginAdmin(String email, String password) async {
+    try {
+      final response = await _client.auth.signInWithPassword(
+        email: email,
+        password: password,
+      );
+      return response.session != null;
+    } catch (e) {
+      debugPrint('Error logging in admin: $e');
+      return false;
+    }
+  }
+
+  Future<int> registerEmployee(
+    Map<String, dynamic> employeeData,
+    List<double> embedding,
+  ) async {
+    try {
+      final employeeResponse = await _client
+          .from('employees')
+          .insert(employeeData)
+          .select()
+          .single();
+
+      final employeeId = employeeResponse['id'] as int;
+      await saveFaceDescriptor(employeeId, embedding);
+
+      // Trigger sync to update local cache immediately
+      syncEmployees();
+
+      return employeeId;
+    } catch (e) {
+      debugPrint('Error registering employee: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> recordAttendance(int employeeId, String type) async {
+    if (await isOnline) {
+      try {
+        final now = DateTime.now();
+        final dateStr = now.toIso8601String().split('T')[0];
+
+        final existing = await _client
+            .from('attendance_logs')
+            .select('id')
+            .eq('employee_id', employeeId)
+            .eq('date', dateStr)
+            .eq('type', type)
+            .maybeSingle();
+
+        if (existing != null) {
+          final label = type == 'time-in' ? 'Time In' : 'Time Out';
+          throw Exception('$label already recorded for today.');
+        }
+
+        final timeStr =
+            "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
+
+        await _client.from('attendance_logs').insert({
+          'employee_id': employeeId,
+          'date': dateStr,
+          'time': timeStr,
+          'type': type,
+        });
+      } catch (e) {
+        debugPrint('Online attendance failed, falling back to offline: $e');
+        await _localDb.insertOfflineLog(employeeId, type, DateTime.now());
+      }
+    } else {
+      await _localDb.insertOfflineLog(employeeId, type, DateTime.now());
+    }
+  }
+
+  Future<String?> uploadEmployeePhoto(int employeeId, File imageFile) async {
+    if (!await isOnline) return null; // Cannot upload offline
+    try {
+      final fileName =
+          '${employeeId}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final path = '$employeeId/$fileName';
+
+      await _client.storage
+          .from('employee-photos')
+          .upload(
+            path,
+            imageFile,
+            fileOptions: const FileOptions(cacheControl: '3600', upsert: false),
+          );
+
+      final publicUrl = _client.storage
+          .from('employee-photos')
+          .getPublicUrl(path);
+      return publicUrl;
+    } catch (e) {
+      debugPrint('Error uploading photo: $e');
+      return null;
+    }
+  }
+
+  Future<int> registerEmployeeWithPhoto(
+    Map<String, dynamic> employeeData,
+    List<double> embedding,
+    File photoFile,
+  ) async {
+    if (!await isOnline) {
+      throw Exception("Registration requires internet connection");
+    }
+
+    int? employeeId;
+    try {
+      employeeId = await registerEmployee(employeeData, embedding);
+      final photoUrl = await uploadEmployeePhoto(employeeId, photoFile);
+
+      if (photoUrl == null) {
+        throw Exception("Photo upload failed");
+      }
+      return employeeId;
+    } catch (e) {
+      debugPrint('Registration with photo failed: $e');
+      if (employeeId != null) {
+        try {
+          await _client.from('employees').delete().eq('id', employeeId);
+        } catch (deleteError) {
+          debugPrint(
+            'CRITICAL: Failed to rollback employee $employeeId: $deleteError',
+          );
+        }
+      }
+      rethrow;
+    }
+  }
+}
