@@ -251,6 +251,9 @@ class SupabaseService {
           'type': type,
         });
       } catch (e) {
+        if (e.toString().contains('already recorded')) {
+          rethrow; // Don't save offline if it's just a duplicate scan
+        }
         debugPrint('Online attendance failed, falling back to offline: $e');
         await _localDb.insertOfflineLog(employeeId, type, DateTime.now());
       }
@@ -259,8 +262,19 @@ class SupabaseService {
     }
   }
 
-  Future<String?> uploadEmployeePhoto(int employeeId, File imageFile) async {
-    if (!await isOnline) return null; // Cannot upload offline
+  Future<String> uploadEmployeePhoto(int employeeId, File imageFile) async {
+    if (!await isOnline)
+      throw Exception("Cannot upload: Check internet connection");
+
+    final user = _client.auth.currentUser;
+    debugPrint(
+      "DEBUG: Uploading photo. User: ${user?.id}, Email: ${user?.email}",
+    );
+
+    if (user == null) {
+      throw Exception("Unauthorized: No active session. Please log in again.");
+    }
+
     try {
       final fileName =
           '${employeeId}_${DateTime.now().millisecondsSinceEpoch}.jpg';
@@ -280,7 +294,7 @@ class SupabaseService {
       return publicUrl;
     } catch (e) {
       debugPrint('Error uploading photo: $e');
-      return null;
+      throw Exception('Photo upload failed: ${e.toString()}');
     }
   }
 
@@ -296,11 +310,8 @@ class SupabaseService {
     int? employeeId;
     try {
       employeeId = await registerEmployee(employeeData, embedding);
-      final photoUrl = await uploadEmployeePhoto(employeeId, photoFile);
+      await uploadEmployeePhoto(employeeId, photoFile);
 
-      if (photoUrl == null) {
-        throw Exception("Photo upload failed");
-      }
       return employeeId;
     } catch (e) {
       debugPrint('Registration with photo failed: $e');

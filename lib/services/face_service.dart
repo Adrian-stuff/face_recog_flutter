@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
-import 'dart:ui';
+
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
-import 'package:face_anti_spoofing_detector/face_anti_spoofing_detector.dart';
+// To re-enable anti-spoofing model, uncomment:
+// import 'package:face_anti_spoofing_detector/face_anti_spoofing_detector.dart';
 import 'package:flutter/foundation.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
@@ -205,6 +206,7 @@ class FaceService {
 
   FaceDetector? _faceDetector;
   Interpreter? _interpreter;
+  Uint8List? _modelBytes;
   bool _isInitialized = false;
   String? _interpreterError;
   Completer<void>? _initCompleter;
@@ -232,14 +234,16 @@ class FaceService {
         ),
       );
 
-      await FaceAntiSpoofingDetector.initialize();
-
+      // To re-enable the anti-spoofing model, uncomment:
+      // await FaceAntiSpoofingDetector.initialize();
       try {
+        // Pre-load model bytes so they can be passed to isolates later.
+        // rootBundle.load only works on the main thread.
+        final rawAsset = await rootBundle.load('assets/mobilefacenet.tflite');
+        _modelBytes = rawAsset.buffer.asUint8List();
+
         final options = InterpreterOptions();
-        _interpreter = await Interpreter.fromAsset(
-          'mobilefacenet.tflite',
-          options: options,
-        );
+        _interpreter = Interpreter.fromBuffer(_modelBytes!, options: options);
         _interpreterError = null;
         debugPrint('Face Recognition Model Loaded');
       } catch (e) {
@@ -259,7 +263,8 @@ class FaceService {
   void dispose() {
     _faceDetector?.close();
     _faceDetector = null;
-    FaceAntiSpoofingDetector.destroy();
+    // To re-enable the anti-spoofing model, uncomment:
+    // FaceAntiSpoofingDetector.destroy();
     _interpreter?.close();
     _interpreter = null;
     _isInitialized = false;
@@ -314,23 +319,12 @@ class FaceService {
 
       final Face face = faces.first;
 
-      // 3. Planar YUV conversion for Anti-Spoofing (Background Isolate)
-      final Uint8List planarYuv = await compute(
-        convertYuvToPlanarIsolate,
-        imageData,
-      );
-
-      final score = await FaceAntiSpoofingDetector.detect(
-        yuvBytes: planarYuv,
-        previewWidth: image.width,
-        previewHeight: image.height,
-        orientation: rotation,
-        faceContour: face.boundingBox,
-      );
-
-      final isLive = (score ?? 0.0) >= 0.8;
-
-      return {'face': face, 'isLive': isLive, 'score': score, 'error': null};
+      return {
+        'face': face,
+        'leftEyeOpen': face.leftEyeOpenProbability,
+        'rightEyeOpen': face.rightEyeOpenProbability,
+        'error': null,
+      };
     } catch (e) {
       debugPrint('Detection failed: $e');
       return {'error': 'Detection failed: $e'};
@@ -353,134 +347,32 @@ class FaceService {
         return null;
       }
 
+      // 1. Prepare data for Isolate
       final imageData = CameraImageData.fromCameraImage(cameraImage, rotation);
-
-      // 1. Convert YUV to RGB Image (Background Isolate)
-      img.Image? image = await compute(convertYuvToRgbIsolate, imageData);
-      if (image == null) return null;
-
-      // 2. Crop Face
-      final Rect boundingBox = face.boundingBox;
-      int left = max(0, boundingBox.left.toInt());
-      int top = max(0, boundingBox.top.toInt());
-      int right = min(image.width, boundingBox.right.toInt());
-      int bottom = min(image.height, boundingBox.bottom.toInt());
-      int width = right - left;
-      int height = bottom - top;
-
-      // Guard against zero or negative crop dimensions
-      if (width <= 0 || height <= 0) {
-        debugPrint('Invalid crop dimensions: ${width}x$height');
-        return null;
+      final rootIsolateToken = RootIsolateToken.instance;
+      if (rootIsolateToken == null) {
+        debugPrint('Could not get RootIsolateToken');
+        return null; // Should fall back or handle error
       }
 
-      img.Image croppedImage = img.copyCrop(
-        image,
-        x: left,
-        y: top,
-        width: width,
-        height: height,
+      final inferenceData = _InferenceData(
+        cameraData: imageData,
+        faceBox: face.boundingBox,
+        token: rootIsolateToken,
+        modelBytes: _modelBytes!,
       );
 
-      // 3. Resize to 112x112
-      img.Image resizedImage = img.copyResize(
-        croppedImage,
-        width: 112,
-        height: 112,
-      );
-
-      // 4. Preprocess (Normalize)
-      final input = _imageToFloatList(resizedImage);
-
-      // 5. Run Inference
-      final outputShape = _interpreter!.getOutputTensor(0).shape;
-      final outputLength = outputShape[1];
-
-      var output = List.generate(1, (_) => List.filled(outputLength, 0.0));
-      _interpreter!.run(input, output);
-
-      final embedding = List<double>.from(output[0]);
-
-      // 6. L2 Normalize
-      return _l2Normalize(embedding);
+      // 2. Offload everything to background isolate
+      return await compute(_inferenceIsolate, inferenceData);
     } catch (e) {
       debugPrint('Error generating embedding: $e');
       return null;
     }
   }
 
-  // Helper: Convert CameraImage to RGB via Isolate (exposed wrapper)
-  Future<img.Image?> convertCameraToRgb(
-    CameraImage cameraImage,
-    int rotation,
-  ) async {
-    if (!_isValidCameraImage(cameraImage)) return null;
-    final imageData = CameraImageData.fromCameraImage(cameraImage, rotation);
-    return await compute(convertYuvToRgbIsolate, imageData);
-  }
-
-  /// Generate Face Embedding from a pre-decoded RGB image and face bounding box.
-  Future<List<double>?> getEmbeddingFromRgbImage(
-    img.Image image,
-    Rect boundingBox,
-  ) async {
-    if (_interpreter == null) {
-      debugPrint('Interpreter not initialized');
-      return null;
-    }
-
-    try {
-      // Crop face region
-      int left = max(0, boundingBox.left.toInt());
-      int top = max(0, boundingBox.top.toInt());
-      int right = min(image.width, boundingBox.right.toInt());
-      int bottom = min(image.height, boundingBox.bottom.toInt());
-      int width = right - left;
-      int height = bottom - top;
-
-      if (width <= 0 || height <= 0) {
-        debugPrint('Invalid crop dimensions: ${width}x$height');
-        return null;
-      }
-
-      img.Image croppedImage = img.copyCrop(
-        image,
-        x: left,
-        y: top,
-        width: width,
-        height: height,
-      );
-
-      // Resize to 112x112
-      img.Image resizedImage = img.copyResize(
-        croppedImage,
-        width: 112,
-        height: 112,
-      );
-
-      // Preprocess
-      final input = _imageToFloatList(resizedImage);
-
-      // Run Inference
-      final outputShape = _interpreter!.getOutputTensor(0).shape;
-      final outputLength = outputShape[1];
-      var output = List.generate(1, (_) => List.filled(outputLength, 0.0));
-      _interpreter!.run(input, output);
-
-      final embedding = List<double>.from(output[0]);
-
-      return _l2Normalize(embedding);
-    } catch (e) {
-      debugPrint('Error generating embedding from RGB image: $e');
-      return null;
-    }
-  }
-
   Future<List<double>?> getFaceEmbeddingFromFile(String imagePath) async {
-    if (_interpreter == null) {
-      debugPrint('Interpreter not initialized');
-      return null;
-    }
+    // Note: We don't check _interpreter here because the isolate will create its own instance.
+    // However, we do need the FaceDetector for the initial detection on main thread.
 
     try {
       final inputImage = InputImage.fromFilePath(imagePath);
@@ -495,42 +387,95 @@ class FaceService {
       }
       final face = faces.first;
 
-      final bytes = await File(imagePath).readAsBytes();
-      img.Image? fullImage = img.decodeImage(bytes);
-      if (fullImage == null) {
-        debugPrint('Failed to decode captured image');
+      // 1. Prepare data for Isolate
+      final rootIsolateToken = RootIsolateToken.instance;
+      if (rootIsolateToken == null) {
+        debugPrint('Could not get RootIsolateToken');
         return null;
       }
 
-      // Re-use the RGB embedding logic
-      return await getEmbeddingFromRgbImage(fullImage, face.boundingBox);
+      final inferenceData = _InferenceData(
+        imagePath: imagePath,
+        faceBox: face.boundingBox,
+        token: rootIsolateToken,
+        modelBytes: _modelBytes!,
+      );
+
+      // 2. Offload heavy work (Decode -> Crop -> Resize -> Inference) to background isolate
+      return await compute(_inferenceIsolate, inferenceData);
     } catch (e) {
       debugPrint('Error generating embedding from file: $e');
       return null;
     }
   }
 
-  bool _isValidCameraImage(CameraImage image) {
-    if (image.planes.length < 3) return false;
-    for (final plane in image.planes) {
-      if (plane.bytes.isEmpty) return false;
-    }
-    final expectedYSize = image.width * image.height;
-    if (image.planes[0].bytes.length < expectedYSize) return false;
-    return true;
-  }
+  // ... (keep _isValidCameraImage and other helpers)
+}
 
-  List<double> _l2Normalize(List<double> embedding) {
-    double sum = 0;
-    for (var x in embedding) {
-      sum += x * x;
-    }
-    double norm = sqrt(sum);
-    if (norm < 1e-10) return embedding;
-    return embedding.map((x) => x / norm).toList();
-  }
+// --- Isolate Data & Logic ---
 
-  List<List<List<List<double>>>> _imageToFloatList(img.Image image) {
+class _InferenceData {
+  final CameraImageData? cameraData;
+  final String? imagePath;
+  final Rect faceBox;
+  final RootIsolateToken token;
+  final Uint8List modelBytes;
+
+  _InferenceData({
+    this.cameraData,
+    this.imagePath,
+    required this.faceBox,
+    required this.token,
+    required this.modelBytes,
+  });
+}
+
+/// Isolate function: Load/Convert Image -> Crop -> Resize -> MobileFaceNet Inference
+Future<List<double>?> _inferenceIsolate(_InferenceData data) async {
+  try {
+    img.Image? fullImage;
+
+    // 1. Get Image Source
+    if (data.imagePath != null) {
+      // Read & Decode Image (Heavy I/O + CPU)
+      final bytes = await File(data.imagePath!).readAsBytes();
+      fullImage = img.decodeImage(bytes);
+    } else if (data.cameraData != null) {
+      // Convert YUV to RGB (CPU)
+      // Note: We are already in an isolate here, so we call the function directly.
+      fullImage = convertYuvToRgbIsolate(data.cameraData!);
+    }
+
+    if (fullImage == null) return null;
+
+    // 3. Crop Face
+    final box = data.faceBox;
+    int left = max(0, box.left.toInt());
+    int top = max(0, box.top.toInt());
+    int right = min(fullImage.width, box.right.toInt());
+    int bottom = min(fullImage.height, box.bottom.toInt());
+    int width = right - left;
+    int height = bottom - top;
+
+    if (width <= 0 || height <= 0) return null;
+
+    img.Image croppedImage = img.copyCrop(
+      fullImage,
+      x: left,
+      y: top,
+      width: width,
+      height: height,
+    );
+
+    // 4. Resize to 112x112 (Heavy CPU)
+    img.Image resizedImage = img.copyResize(
+      croppedImage,
+      width: 112,
+      height: 112,
+    );
+
+    // 5. Preprocess (Normalize)
+    // We duplicate _imageToFloatList here to avoid static access issues or move it to top-level
     var input = List.generate(
       1,
       (i) => List.generate(
@@ -541,12 +486,50 @@ class FaceService {
 
     for (var y = 0; y < 112; y++) {
       for (var x = 0; x < 112; x++) {
-        var pixel = image.getPixel(x, y);
-        input[0][y][x][0] = (pixel.r - 128) / 128;
-        input[0][y][x][1] = (pixel.g - 128) / 128;
-        input[0][y][x][2] = (pixel.b - 128) / 128;
+        var pixel = resizedImage.getPixel(x, y);
+        input[0][y][x][0] = (pixel.r - 128) / 128; // R
+        input[0][y][x][1] = (pixel.g - 128) / 128; // G
+        input[0][y][x][2] = (pixel.b - 128) / 128; // B
       }
     }
-    return input;
+
+    // 6. Load Model & Run Inference
+    // Use fromBuffer with pre-loaded bytes (rootBundle.load doesn't work in isolates).
+    final options = InterpreterOptions();
+    final interpreter = Interpreter.fromBuffer(
+      data.modelBytes,
+      options: options,
+    );
+
+    final outputShape = interpreter.getOutputTensor(0).shape;
+    final outputLength = outputShape[1];
+    var output = List.generate(1, (_) => List.filled(outputLength, 0.0));
+
+    interpreter.run(input, output);
+    interpreter.close();
+
+    final embedding = List<double>.from(output[0]);
+
+    // 7. L2 Normalize
+    double sum = 0;
+    for (var x in embedding) {
+      sum += x * x;
+    }
+    double norm = sqrt(sum);
+    if (norm < 1e-10) return embedding;
+    return embedding.map((x) => x / norm).toList();
+  } catch (e) {
+    debugPrint("Isolate Inference Error: $e");
+    return null;
   }
+}
+
+bool _isValidCameraImage(CameraImage image) {
+  if (image.planes.length < 3) return false;
+  for (final plane in image.planes) {
+    if (plane.bytes.isEmpty) return false;
+  }
+  final expectedYSize = image.width * image.height;
+  if (image.planes[0].bytes.length < expectedYSize) return false;
+  return true;
 }

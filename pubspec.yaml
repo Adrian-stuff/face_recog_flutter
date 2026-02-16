@@ -31,7 +31,7 @@ dependencies:
   flutter:
     sdk: flutter
   supabase_flutter: ^2.8.3
-  face_anti_spoofing_detector: ^0.0.2
+  face_anti_spoofing_detector: ^0.0.2 # Not used in active liveness flow; kept for easy re-enablement
   google_mlkit_face_detection: ^0.12.0
   permission_handler: ^11.3.1
   image_picker: ^1.1.2
@@ -42,6 +42,12 @@ dependencies:
     path: packages/tflite_flutter
   connectivity_plus: ^7.0.0
   network_info_plus: ^5.0.1
+  screen_brightness: ^1.0.1
+  http: ^1.2.0
+  intl: ^0.19.0
+  table_calendar: ^3.1.0
+  geolocator: ^10.1.0
+  wakelock_plus: ^1.2.0
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.

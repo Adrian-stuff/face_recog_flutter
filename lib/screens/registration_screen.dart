@@ -69,7 +69,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   }
 
   void _startFaceDetection() {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+    if (_cameraController == null ||
+        !_cameraController!.value.isInitialized ||
+        _cameraController!.value.isStreamingImages) {
       return;
     }
 

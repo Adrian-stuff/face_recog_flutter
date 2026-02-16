@@ -1,11 +1,14 @@
-import 'package:camera/camera.dart';
+import 'dart:async';
+import 'package:connectivity_plus/connectivity_plus.dart';
+
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:table_calendar/table_calendar.dart';
 import '../services/face_service.dart';
 import '../services/supabase_service.dart';
-import '../widgets/camera_view.dart';
-import '../widgets/face_overlay.dart';
 import '../widgets/real_time_clock.dart';
+import '../widgets/weather_widget.dart';
+import 'liveness_check_screen.dart';
 import 'registration_screen.dart';
 
 class FaceScanScreen extends StatefulWidget {
@@ -16,186 +19,123 @@ class FaceScanScreen extends StatefulWidget {
 }
 
 class _FaceScanScreenState extends State<FaceScanScreen> {
-  CameraController? _cameraController;
-  bool _isDetecting = false;
-  String _statusMessage = "Initializing...";
-  List<CameraDescription> _cameras = [];
-
   final SupabaseService _supabaseService = SupabaseService();
   final FaceService _faceService = FaceService();
 
-  bool _isLiveFaceDetected = false;
-  bool _isProcessing = false; // Guards the capture+verify+record flow
+  bool _isProcessing = false;
+  String _statusMessage = "Loading...";
+  bool _isConnected = true;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
+
+  // Calendar state
+  CalendarFormat _calendarFormat = CalendarFormat.month;
+  DateTime _focusedDay = DateTime.now();
+  DateTime? _selectedDay;
 
   @override
   void initState() {
     super.initState();
-    _initializeCamera();
+    _initConnectivity();
+    _initialize();
   }
 
-  Future<void> _initializeCamera() async {
-    // Wait briefly so NetworkGuard's location permission request finishes first
-    // (PermissionHandler can only handle one request at a time)
-    await Future.delayed(const Duration(milliseconds: 500));
-
-    // Request camera permission (check status first to avoid unnecessary dialogs)
-    var cameraStatus = await Permission.camera.status;
-    if (!cameraStatus.isGranted) {
-      cameraStatus = await Permission.camera.request();
-      if (!cameraStatus.isGranted) {
-        if (mounted) {
-          setState(() => _statusMessage = "Camera permission denied");
-        }
-        return;
-      }
-    }
-
-    _cameras = await availableCameras();
-
-    if (_cameras.isEmpty) {
-      if (mounted) setState(() => _statusMessage = "No cameras found");
-      return;
-    }
-
-    // Select front camera
-    final frontCamera = _cameras.firstWhere(
-      (camera) => camera.lensDirection == CameraLensDirection.front,
-      orElse: () => _cameras.first,
-    );
-
-    _cameraController = CameraController(
-      frontCamera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
-
-    try {
-      await _cameraController!.initialize();
-      await _faceService.initialize();
-
-      if (mounted) {
-        setState(() {
-          _statusMessage = "Ready. Select Employee & Point camera.";
-        });
-        _startForFaceDetection();
-
-        // Trigger background sync
-        _supabaseService.syncEmployees();
-        _supabaseService.syncLogs();
-      }
-    } catch (e) {
-      if (mounted) setState(() => _statusMessage = "Camera Error: $e");
-    }
-  }
-
-  void _startForFaceDetection() {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return;
-    }
-
-    _cameraController!.startImageStream((CameraImage image) async {
-      if (_isDetecting) return;
-      _isDetecting = true;
-
-      try {
-        final result = await _faceService.processImage(
-          image,
-          _cameraController!.description.sensorOrientation,
-        );
-
-        if (result['error'] != null) {
-          if (mounted && !_isProcessing) {
-            setState(() {
-              if (result['error'] != 'No face detected') {
-                _statusMessage = result['error'];
-              } else {
-                _statusMessage = "Align face to camera";
-              }
-              _isLiveFaceDetected = false;
-            });
-          }
-        } else {
-          final isLive = result['isLive'] as bool;
-          final score = result['score'] as double?;
-
-          if (mounted && !_isProcessing) {
-            setState(() {
-              _isLiveFaceDetected = isLive;
-              if (isLive) {
-                _statusMessage =
-                    "Live face detected (${score?.toStringAsFixed(3)}) — Press TIME IN or TIME OUT";
-              } else {
-                _statusMessage =
-                    "SPOOF DETECTED! (${score?.toStringAsFixed(3)})";
-              }
-            });
-          }
-        }
-      } catch (e) {
-        debugPrint("Error processing image: $e");
-      } finally {
-        _isDetecting = false;
-      }
+  void _initConnectivity() {
+    _connectivitySubscription = Connectivity().onConnectivityChanged.listen((
+      results,
+    ) {
+      final isConnected = results.any((r) => r != ConnectivityResult.none);
+      if (mounted) setState(() => _isConnected = isConnected);
     });
   }
 
-  /// Called when user presses TIME IN or TIME OUT.
-  /// Stops stream → takes picture → generates embedding → verifies via RPC → records attendance.
+  Future<void> _initialize() async {
+    // Request permissions upfront
+    await [Permission.camera, Permission.location].request();
+
+    // Pre-warm FaceService (loads TFLite model)
+    try {
+      await _faceService.initialize();
+      if (mounted) setState(() => _statusMessage = "Ready");
+    } catch (e) {
+      debugPrint("FaceService init error: $e");
+      if (mounted) setState(() => _statusMessage = "Service Error");
+    }
+
+    // Trigger background sync
+    _supabaseService.syncEmployees();
+    _supabaseService.syncLogs();
+  }
+
   Future<void> _recordAttendance(String type) async {
     if (_isProcessing) return;
-    if (!_isLiveFaceDetected) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text("No live face detected")));
-      }
-      return;
-    }
 
     setState(() {
       _isProcessing = true;
-      _statusMessage = "Verifying identity...";
+      _statusMessage = "Opening liveness check...";
     });
 
     try {
-      // 1. Stop the image stream
-      await _cameraController!.stopImageStream();
+      // Navigate to LivenessCheckScreen — returns photo path on success.
+      final photoPath = await Navigator.push<String?>(
+        context,
+        MaterialPageRoute(builder: (_) => const LivenessCheckScreen()),
+      );
 
-      // 2. Take a still photo
-      final photo = await _cameraController!.takePicture();
+      if (!mounted) return;
 
-      // 3. Generate embedding from the captured image
-      final embedding = await _faceService.getFaceEmbeddingFromFile(photo.path);
+      if (photoPath == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Liveness check cancelled."),
+            backgroundColor: Colors.orange,
+          ),
+        );
+        setState(() {
+          _isProcessing = false;
+          _statusMessage = "Ready";
+        });
+        return;
+      }
+
+      setState(() => _statusMessage = "Verifying identity...");
+
+      // Generate embedding from photo.
+      final embedding = await _faceService.getFaceEmbeddingFromFile(photoPath);
       if (embedding == null) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text("Could not extract face from photo. Try again."),
+              content: Text("Could not extract face. Try again."),
               backgroundColor: Colors.red,
             ),
           );
         }
-        _restartDetection();
+        setState(() {
+          _isProcessing = false;
+          _statusMessage = "Ready";
+        });
         return;
       }
 
-      // 4. Verify face against database (pgvector cosine similarity)
+      // Verify face.
       final matchedEmployee = await _supabaseService.verifyFace(embedding);
       if (matchedEmployee == null) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text("Face not recognized. Please register first."),
+              content: Text("Face not recognized."),
               backgroundColor: Colors.red,
             ),
           );
         }
-        _restartDetection();
+        setState(() {
+          _isProcessing = false;
+          _statusMessage = "Ready";
+        });
         return;
       }
 
-      // 5. Record attendance for the verified employee
+      // Record attendance.
       final employeeId = matchedEmployee['id'] as int;
       final firstName = matchedEmployee['first_name'] ?? '';
       final lastName = matchedEmployee['last_name'] ?? '';
@@ -205,11 +145,19 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
 
       if (mounted) {
         final action = type == 'time-in' ? 'Time In' : 'Time Out';
+        final now = DateTime.now();
+        // Simple formatting to avoid intl dependency if not already imported,
+        // but since we added intl earlier for calendar, we can use it.
+        // Or just basic string manip to be safe/quick.
+        final timeString =
+            "${now.hour > 12 ? now.hour - 12 : (now.hour == 0 ? 12 : now.hour)}:${now.minute.toString().padLeft(2, '0')} ${now.hour >= 12 ? 'PM' : 'AM'}";
+
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '$action recorded for $firstName $lastName '
-              '(${(similarity * 100).toStringAsFixed(1)}% match)',
+              '$action recorded for $firstName $lastName at $timeString\n'
+              'Match: ${(similarity * 100).toStringAsFixed(1)}%',
+              style: const TextStyle(fontSize: 16),
             ),
             backgroundColor: Colors.green,
             duration: const Duration(seconds: 4),
@@ -223,20 +171,19 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
         );
       }
     } finally {
-      _restartDetection();
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+          _statusMessage = "Ready";
+        });
+      }
     }
   }
 
-  /// Restart the camera stream and reset state for the next person.
-  void _restartDetection() {
-    if (mounted) {
-      setState(() {
-        _isProcessing = false;
-        _isLiveFaceDetected = false;
-        _statusMessage = "Ready — Align face to camera";
-      });
-    }
-    _startForFaceDetection();
+  @override
+  void dispose() {
+    _connectivitySubscription?.cancel();
+    super.dispose();
   }
 
   Future<void> _showAdminLoginDialog() async {
@@ -272,7 +219,6 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
               final email = emailController.text;
               final password = passwordController.text;
 
-              // Close dialog first
               Navigator.pop(dialogContext);
 
               final success = await _supabaseService.loginAdmin(
@@ -282,30 +228,12 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
 
               if (mounted) {
                 if (success) {
-                  // Stop camera before navigating to avoid resource conflict
-                  if (_cameraController != null) {
-                    await _cameraController!.stopImageStream();
-                    await _cameraController!.dispose();
-                    setState(() {
-                      _cameraController = null;
-                      _isDetecting = false;
-                      _statusMessage = "Paused for Registration";
-                    });
-                  }
-
-                  if (!mounted) return;
-
                   await Navigator.push(
                     context,
                     MaterialPageRoute(
                       builder: (_) => const RegistrationScreen(),
                     ),
                   );
-
-                  // Re-initialize camera when returning from RegistrationScreen
-                  if (mounted) {
-                    _initializeCamera();
-                  }
                 } else {
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
@@ -324,48 +252,202 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
   }
 
   @override
-  void dispose() {
-    _cameraController?.dispose();
-    _faceService.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text("Face Attendance"),
+        centerTitle: true,
         actions: [
+          // Internet Status Indicator
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: _isConnected
+                  ? Colors.green.withOpacity(0.1)
+                  : Colors.red.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: _isConnected ? Colors.green : Colors.red,
+                width: 1,
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  _isConnected ? Icons.wifi : Icons.wifi_off,
+                  color: _isConnected ? Colors.green : Colors.red,
+                  size: 16,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  _isConnected ? "Online" : "Offline",
+                  style: TextStyle(
+                    color: _isConnected ? Colors.green : Colors.red,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.admin_panel_settings),
             onPressed: _showAdminLoginDialog,
           ),
         ],
       ),
-      body: Stack(
-        children: [
-          if (_cameraController != null &&
-              _cameraController!.value.isInitialized)
-            CameraView(controller: _cameraController!)
-          else
-            Center(child: Text(_statusMessage)),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 1. Date & Time
+                    const Center(child: RealTimeClock()),
+                    const SizedBox(height: 20),
 
-          FaceOverlay(
-            isLive: _isLiveFaceDetected,
-            statusMessage: _statusMessage,
-            canRegister: _isLiveFaceDetected && !_isProcessing,
-            onTimeIn: () => _recordAttendance('time-in'),
-            onTimeOut: () => _recordAttendance('time-out'),
-          ),
+                    // 2. Weather Widget
+                    const WeatherWidget(),
+                    const SizedBox(height: 20),
 
-          // Clock Overlay
-          const Positioned(
-            top: 40,
-            left: 0,
-            right: 0,
-            child: Center(child: RealTimeClock()),
-          ),
-        ],
+                    // 3. Status Display
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.blue.withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                      ),
+                      child: Text(
+                        _statusMessage,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w500,
+                          color: Colors.blue.shade800,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // 4. Calendar
+                    Card(
+                      elevation: 4,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(8.0),
+                        child: TableCalendar(
+                          firstDay: DateTime.utc(2020, 1, 1),
+                          lastDay: DateTime.utc(2030, 12, 31),
+                          focusedDay: _focusedDay,
+                          calendarFormat: _calendarFormat,
+                          selectedDayPredicate: (day) {
+                            return isSameDay(_selectedDay, day);
+                          },
+                          onDaySelected: (selectedDay, focusedDay) {
+                            if (!isSameDay(_selectedDay, selectedDay)) {
+                              setState(() {
+                                _selectedDay = selectedDay;
+                                _focusedDay = focusedDay;
+                              });
+                            }
+                          },
+                          onFormatChanged: (format) {
+                            if (_calendarFormat != format) {
+                              setState(() {
+                                _calendarFormat = format;
+                              });
+                            }
+                          },
+                          onPageChanged: (focusedDay) {
+                            _focusedDay = focusedDay;
+                          },
+                          headerStyle: const HeaderStyle(
+                            formatButtonVisible: false,
+                            titleCentered: true,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // 5. Action Buttons (Sticky at bottom)
+            Container(
+              padding: const EdgeInsets.all(16.0),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.1),
+                    blurRadius: 10,
+                    offset: const Offset(0, -4),
+                  ),
+                ],
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _buildActionButton(
+                      label: "TIME IN",
+                      color: Colors.green,
+                      icon: Icons.login,
+                      onPressed: _isProcessing
+                          ? null
+                          : () => _recordAttendance('time-in'),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: _buildActionButton(
+                      label: "TIME OUT",
+                      color: Colors.orange,
+                      icon: Icons.logout,
+                      onPressed: _isProcessing
+                          ? null
+                          : () => _recordAttendance('time-out'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActionButton({
+    required String label,
+    required Color color,
+    required IconData icon,
+    VoidCallback? onPressed,
+  }) {
+    return ElevatedButton.icon(
+      onPressed: onPressed,
+      style: ElevatedButton.styleFrom(
+        backgroundColor: color,
+        padding: const EdgeInsets.symmetric(vertical: 20),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        elevation: 4,
+      ),
+      icon: Icon(icon, color: Colors.white, size: 28),
+      label: Text(
+        label,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 18,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 1.0,
+        ),
       ),
     );
   }
