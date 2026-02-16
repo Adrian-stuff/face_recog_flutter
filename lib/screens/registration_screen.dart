@@ -36,6 +36,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   // Blink Verification State
   bool _isVerifyingBlink = false;
   bool _eyesClosedDetected = false;
+  bool _isFaceAligned = false;
 
   @override
   void initState() {
@@ -89,18 +90,20 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
         if (mounted) {
           if (result['error'] != null) {
-            if (result['error'] == 'No face detected') {
-              if (!_isVerifyingBlink) {
-                // Don't clear status if verify blink
-                setState(() {
-                  _statusMessage = "No face detected";
-                });
+            final error = result['error'];
+            setState(() {
+              _isFaceAligned = false;
+              if (error == 'No face detected') {
+                if (!_isVerifyingBlink) _statusMessage = "No face detected";
+              } else if (error == 'Multiple faces detected') {
+                _statusMessage = "Multiple faces detected - Only one allowed";
               }
-            }
+            });
           } else {
             // Face Found
             if (!_isVerifyingBlink && _capturedDescriptor == null) {
               setState(() {
+                _isFaceAligned = true;
                 _statusMessage = "Face Detected - Ready to Capture";
               });
             } else if (_isVerifyingBlink) {
@@ -384,8 +387,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
                 if (_capturedDescriptor == null)
                   ElevatedButton.icon(
-                    onPressed: (_isVerifyingBlink)
-                        ? null // Disable button while verifying blink
+                    onPressed: (_isVerifyingBlink || !_isFaceAligned)
+                        ? null // Disable button while verifying blink OR face not valid
                         : _initiateCapture,
                     icon: const Icon(Icons.camera_alt),
                     label: Text(
