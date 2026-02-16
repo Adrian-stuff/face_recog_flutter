@@ -4,8 +4,7 @@ import 'dart:math';
 
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
-// To re-enable anti-spoofing model, uncomment:
-// import 'package:face_anti_spoofing_detector/face_anti_spoofing_detector.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
@@ -90,62 +89,6 @@ img.Image? convertYuvToRgbIsolate(CameraImageData data) {
     debugPrint("Isolate Error converting YUV: $e");
     return null;
   }
-}
-
-/// Isolate function: Convert to Planar YUV (for Anti-Spoofing)
-Uint8List convertYuvToPlanarIsolate(CameraImageData data) {
-  final int width = data.width;
-  final int height = data.height;
-  final int ySize = width * height;
-  final int uvWidth = width ~/ 2;
-  final int uvHeight = height ~/ 2;
-  final int uvPlaneSize = uvWidth * uvHeight;
-
-  final Uint8List result = Uint8List(ySize + uvPlaneSize * 2);
-
-  // Y Plane
-  final Uint8List yPlane = data.planesBytes[0];
-  final int yRowStride = data.bytesPerRow[0];
-  for (int row = 0; row < height; row++) {
-    final int srcOffset = row * yRowStride;
-    final int dstOffset = row * width;
-    final int end = srcOffset + width;
-    if (end <= yPlane.length) {
-      result.setRange(
-        dstOffset,
-        dstOffset + width,
-        yPlane.buffer.asUint8List(yPlane.offsetInBytes + srcOffset, width),
-      );
-    }
-  }
-
-  // U Plane
-  final Uint8List uPlane = data.planesBytes[1];
-  final int uvRowStride = data.bytesPerRow[1];
-  final int uvPixelStride = data.bytesPerPixel[1] ?? 1;
-  int uOffset = ySize;
-  for (int row = 0; row < uvHeight; row++) {
-    for (int col = 0; col < uvWidth; col++) {
-      final int idx = row * uvRowStride + col * uvPixelStride;
-      if (idx < uPlane.length) {
-        result[uOffset++] = uPlane[idx];
-      }
-    }
-  }
-
-  // V Plane
-  final Uint8List vPlane = data.planesBytes[2];
-  int vOffset = ySize + uvPlaneSize;
-  for (int row = 0; row < uvHeight; row++) {
-    for (int col = 0; col < uvWidth; col++) {
-      final int idx = row * uvRowStride + col * uvPixelStride;
-      if (idx < vPlane.length) {
-        result[vOffset++] = vPlane[idx];
-      }
-    }
-  }
-
-  return result;
 }
 
 /// Isolate function: Convert to NV21 (for ML Kit)
@@ -234,8 +177,6 @@ class FaceService {
         ),
       );
 
-      // To re-enable the anti-spoofing model, uncomment:
-      // await FaceAntiSpoofingDetector.initialize();
       try {
         // Pre-load model bytes so they can be passed to isolates later.
         // rootBundle.load only works on the main thread.
@@ -263,8 +204,7 @@ class FaceService {
   void dispose() {
     _faceDetector?.close();
     _faceDetector = null;
-    // To re-enable the anti-spoofing model, uncomment:
-    // FaceAntiSpoofingDetector.destroy();
+
     _interpreter?.close();
     _interpreter = null;
     _isInitialized = false;
