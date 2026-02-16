@@ -240,6 +240,11 @@ class SupabaseService {
   }
 
   Future<void> recordAttendance(int employeeId, String type) async {
+    // 1. Check local cache (prevents duplicate requests from this device)
+    if (await _localDb.hasLogForToday(employeeId, type)) {
+      throw Exception("Attendance already recorded today ($type)");
+    }
+
     final now = DateTime.now();
     final timeStr =
         "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
@@ -261,7 +266,8 @@ class SupabaseService {
         );
 
         if (response.statusCode >= 200 && response.statusCode < 300) {
-          // Success
+          // Success - Cache locally so we don't allow duplicates on this device
+          await _localDb.insertLog(employeeId, type, now, isSynced: true);
           return;
         } else if (response.statusCode >= 400 && response.statusCode < 500) {
           // Client Error (e.g., 400 Bad Request, 404 Not Found)

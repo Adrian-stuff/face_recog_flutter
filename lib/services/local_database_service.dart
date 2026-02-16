@@ -4,7 +4,8 @@ import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
 class LocalDatabaseService {
-  static final LocalDatabaseService _instance = LocalDatabaseService._internal();
+  static final LocalDatabaseService _instance =
+      LocalDatabaseService._internal();
   factory LocalDatabaseService() => _instance;
   LocalDatabaseService._internal();
 
@@ -63,8 +64,8 @@ class LocalDatabaseService {
           'last_name': emp['last_name'],
           'position': emp['position'],
           // Store face_features as JSON string if available, else null
-          'face_features': emp['face_features'] != null 
-              ? jsonEncode(emp['face_features']) 
+          'face_features': emp['face_features'] != null
+              ? jsonEncode(emp['face_features'])
               : null,
         });
       }
@@ -81,15 +82,56 @@ class LocalDatabaseService {
 
   // --- Offline Attendance Methods ---
 
-  Future<void> insertOfflineLog(int employeeId, String type, DateTime timestamp) async {
+  Future<bool> hasLogForToday(int employeeId, String type) async {
+    final db = await database;
+    final now = DateTime.now();
+    final startOfDay = DateTime(now.year, now.month, now.day).toIso8601String();
+    final endOfDay = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      23,
+      59,
+      59,
+    ).toIso8601String();
+
+    final result = await db.query(
+      'attendance_logs',
+      where: 'employee_id = ? AND type = ? AND timestamp BETWEEN ? AND ?',
+      whereArgs: [employeeId, type, startOfDay, endOfDay],
+    );
+
+    return result.isNotEmpty;
+  }
+
+  Future<void> insertLog(
+    int employeeId,
+    String type,
+    DateTime timestamp, {
+    bool isSynced = false,
+  }) async {
+    if (await hasLogForToday(employeeId, type)) {
+      throw Exception("Already recorded on this device today ($type)");
+    }
+
     final db = await database;
     await db.insert('attendance_logs', {
       'employee_id': employeeId,
       'type': type,
       'timestamp': timestamp.toIso8601String(),
-      'is_synced': 0, // Not synced yet
+      'is_synced': isSynced ? 1 : 0,
     });
-    debugPrint('Offline log saved for Employee $employeeId ($type)');
+    debugPrint(
+      '${isSynced ? "Online" : "Offline"} log saved for Employee $employeeId ($type)',
+    );
+  }
+
+  Future<void> insertOfflineLog(
+    int employeeId,
+    String type,
+    DateTime timestamp,
+  ) async {
+    await insertLog(employeeId, type, timestamp, isSynced: false);
   }
 
   // --- Synchronization Methods (Up: Local -> Supabase) ---

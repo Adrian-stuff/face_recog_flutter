@@ -1,4 +1,4 @@
-import 'package:flutter_beep/flutter_beep.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
 class SoundService {
@@ -11,6 +11,7 @@ class SoundService {
   SoundService._internal();
 
   final FlutterTts _flutterTts = FlutterTts();
+  static const _platform = MethodChannel('com.example.mobile_app/sound');
   bool _isInitialized = false;
 
   Future<void> initialize() async {
@@ -29,8 +30,8 @@ class SoundService {
 
   Future<void> playSuccess({String message = "Success"}) async {
     try {
-      // Play a positive beep
-      await FlutterBeep.playSysSound(AndroidSoundIDs.TONE_PROP_BEEP); 
+      // Play a positive beep (Type 1)
+      await _platform.invokeMethod('playSystemSound', {'type': 1});
       await _speak(message);
     } catch (e) {
       print("Error playing success sound: $e");
@@ -39,8 +40,8 @@ class SoundService {
 
   Future<void> playError({String message = "Error"}) async {
     try {
-      // Play a negative beep
-      await FlutterBeep.playSysSound(AndroidSoundIDs.TONE_SUP_ERROR);
+      // Play a negative beep (Type 2)
+      await _platform.invokeMethod('playSystemSound', {'type': 2});
       await _speak(message);
     } catch (e) {
       print("Error playing error sound: $e");
