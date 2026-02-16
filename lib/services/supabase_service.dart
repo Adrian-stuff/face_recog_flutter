@@ -1,9 +1,12 @@
 import 'dart:io';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:http/http.dart' as http;
 
 import 'dart:math';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import '../config/app_config.dart';
 import 'local_database_service.dart';
 
 class SupabaseService {
@@ -69,15 +72,26 @@ class SupabaseService {
 
     for (var log in logs) {
       try {
-        await _client.from('attendance_logs').insert({
-          'employee_id': log['employee_id'],
-          'date': (log['timestamp'] as String).split('T')[0],
-          'time': (log['timestamp'] as String).split('T')[1].substring(0, 8),
-          'type': log['type'],
-        });
+        final timestamp = log['timestamp'] as String;
+        final timeStr = timestamp.split('T')[1].substring(0, 8);
 
-        // Mark as synced only if successful
-        await _localDb.markLogsAsSynced([log['id'] as int]);
+        final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/attendance/log');
+        final response = await http.post(
+          url,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'employeeId': log['employee_id'],
+            'type': log['type'],
+            'time': timeStr,
+          }),
+        );
+
+        if (response.statusCode == 200) {
+          // Mark as synced only if successful
+          await _localDb.markLogsAsSynced([log['id'] as int]);
+        } else {
+          debugPrint('Failed to sync log ${log['id']}: ${response.body}');
+        }
       } catch (e) {
         debugPrint('Failed to sync log ${log['id']}: $e');
       }
@@ -223,42 +237,36 @@ class SupabaseService {
   }
 
   Future<void> recordAttendance(int employeeId, String type) async {
+    final now = DateTime.now();
+    final timeStr =
+        "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
+
     if (await isOnline) {
       try {
-        final now = DateTime.now();
-        final dateStr = now.toIso8601String().split('T')[0];
+        final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/attendance/log');
+        final response = await http.post(
+          url,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'employeeId': employeeId,
+            'type': type,
+            'time': timeStr,
+          }),
+        );
 
-        final existing = await _client
-            .from('attendance_logs')
-            .select('id')
-            .eq('employee_id', employeeId)
-            .eq('date', dateStr)
-            .eq('type', type)
-            .maybeSingle();
-
-        if (existing != null) {
-          final label = type == 'time-in' ? 'Time In' : 'Time Out';
-          throw Exception('$label already recorded for today.');
+        if (response.statusCode != 200) {
+          final errorData = jsonDecode(response.body);
+          throw Exception(errorData['error'] ?? 'Failed to record attendance');
         }
-
-        final timeStr =
-            "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
-
-        await _client.from('attendance_logs').insert({
-          'employee_id': employeeId,
-          'date': dateStr,
-          'time': timeStr,
-          'type': type,
-        });
       } catch (e) {
         if (e.toString().contains('already recorded')) {
-          rethrow; // Don't save offline if it's just a duplicate scan
+          rethrow;
         }
         debugPrint('Online attendance failed, falling back to offline: $e');
-        await _localDb.insertOfflineLog(employeeId, type, DateTime.now());
+        await _localDb.insertOfflineLog(employeeId, type, now);
       }
     } else {
-      await _localDb.insertOfflineLog(employeeId, type, DateTime.now());
+      await _localDb.insertOfflineLog(employeeId, type, now);
     }
   }
 
