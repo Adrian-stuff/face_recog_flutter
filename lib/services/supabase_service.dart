@@ -260,15 +260,36 @@ class SupabaseService {
           }),
         );
 
-        if (response.statusCode != 200) {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          // Success
+          return;
+        } else if (response.statusCode >= 400 && response.statusCode < 500) {
+          // Client Error (e.g., 400 Bad Request, 404 Not Found)
+          // Do NOT fallback to offline. Throw error immediately.
           final errorData = jsonDecode(response.body);
-          throw Exception(errorData['error'] ?? 'Failed to record attendance');
+          throw Exception(
+            errorData['error'] ?? 'Request failed: ${response.statusCode}',
+          );
+        } else {
+          // Server Error (5xx)
+          // Fallback to offline
+          throw HttpException('Server Error: ${response.statusCode}');
         }
       } catch (e) {
-        if (e.toString().contains('already recorded')) {
+        // If it's a specific logic error (4xx handled above), rethrow it.
+        // We detect this by checking if it's NOT a network/server type error.
+        // However, since we throw generic Exception for 4xx above, we need to be careful.
+        // Let's refine:
+
+        if (e.toString().contains('Request failed') ||
+            e.toString().contains('already recorded') ||
+            e.toString().contains('Shift not found')) {
           rethrow;
         }
-        debugPrint('Online attendance failed, falling back to offline: $e');
+
+        debugPrint(
+          'Online attendance failed (Network/Server), falling back to offline: $e',
+        );
         await _localDb.insertOfflineLog(employeeId, type, now);
       }
     } else {

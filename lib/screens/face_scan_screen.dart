@@ -166,8 +166,16 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       }
     } catch (e) {
       if (mounted) {
+        // Clean up the error message
+        String errorMessage = e.toString().replaceAll('Exception: ', '');
+
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Error: $e"), backgroundColor: Colors.red),
+          SnackBar(
+            content: Text(errorMessage),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 4),
+          ),
         );
       }
     } finally {

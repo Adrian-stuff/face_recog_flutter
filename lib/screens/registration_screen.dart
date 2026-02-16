@@ -30,10 +30,12 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   bool _isDetecting = false;
   String _statusMessage = "Align face to register";
-  bool _isLiveFaceDetected = false;
   List<double>? _capturedDescriptor;
   String? _capturedImagePath; // Path to the frozen capture image
-  bool _shouldCapture = false;
+
+  // Blink Verification State
+  bool _isVerifyingBlink = false;
+  bool _eyesClosedDetected = false;
 
   @override
   void initState() {
@@ -88,74 +90,37 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         if (mounted) {
           if (result['error'] != null) {
             if (result['error'] == 'No face detected') {
-              setState(() {
-                _statusMessage = "No face detected";
-                _isLiveFaceDetected = false;
-              });
+              if (!_isVerifyingBlink) {
+                // Don't clear status if verify blink
+                setState(() {
+                  _statusMessage = "No face detected";
+                });
+              }
             }
           } else {
-            final isLive = result['isLive'] as bool;
-
-            setState(() {
-              _isLiveFaceDetected = isLive;
-              _statusMessage = isLive
-                  ? "Face Detected - Ready to Capture"
-                  : "Spoof Detected";
-            });
-
-            // Capture Logic: when button pressed and live face confirmed
-            if (_shouldCapture && isLive) {
-              _shouldCapture = false;
-
+            // Face Found
+            if (!_isVerifyingBlink && _capturedDescriptor == null) {
               setState(() {
-                _statusMessage = "Capturing...";
+                _statusMessage = "Face Detected - Ready to Capture";
               });
+            } else if (_isVerifyingBlink) {
+              // --- Blink Verification Logic ---
+              final double leftEye = result['leftEyeOpen'] ?? 1.0;
+              final double rightEye = result['rightEyeOpen'] ?? 1.0;
 
-              // 1. Stop the image stream
-              await _cameraController!.stopImageStream();
+              // Thresholds (tunable)
+              const double closeThreshold = 0.2;
+              const double openThreshold = 0.8;
 
-              // 2. Take a still photo (frozen preview + source for embedding)
-              try {
-                final XFile photo = await _cameraController!.takePicture();
-
-                if (mounted) {
-                  setState(() {
-                    _capturedImagePath = photo.path;
-                    _statusMessage = "Generating face data...";
-                  });
-                }
-
-                // 3. Generate embedding from the saved JPEG file
-                final embedding = await _faceService.getFaceEmbeddingFromFile(
-                  photo.path,
-                );
-
-                if (embedding != null && mounted) {
-                  setState(() {
-                    _capturedDescriptor = embedding;
-                    _statusMessage = "Face Captured Successfully!";
-                  });
-                } else if (mounted) {
-                  // Embedding failed — show reason, clear image, restart
-                  final reason = _faceService.isInterpreterReady
-                      ? "No face found in photo"
-                      : "Model not loaded: ${_faceService.interpreterErrorMessage}";
-                  setState(() {
-                    _capturedImagePath = null;
-                    _statusMessage = "Capture failed: $reason";
-                  });
-                  _startFaceDetection();
-                }
-              } catch (e) {
-                debugPrint("Capture error: $e");
-                if (mounted) {
-                  setState(() {
-                    _statusMessage = "Capture error: $e";
-                  });
-                  _startFaceDetection();
-                }
+              if (leftEye < closeThreshold && rightEye < closeThreshold) {
+                _eyesClosedDetected = true;
               }
-              return; // Don't continue processing in this callback
+
+              if (_eyesClosedDetected &&
+                  (leftEye > openThreshold && rightEye > openThreshold)) {
+                // Blink Completed!
+                _finalizeCapture();
+              }
             }
           }
         }
@@ -167,24 +132,113 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     });
   }
 
+  Future<void> _initiateCapture() async {
+    if (_cameraController == null || !_cameraController!.value.isInitialized)
+      return;
+
+    setState(() {
+      _statusMessage = "Capturing...";
+      _isDetecting = true; // Block stream processing mainly
+    });
+
+    // 1. Pause Stream (implicitly handled by taking picture logic usually, but let's be safe)
+    await _cameraController!.stopImageStream();
+
+    // 2. Take Picture
+    try {
+      final XFile photo = await _cameraController!.takePicture();
+
+      // 3. Save, but don't finalize yet
+      _capturedImagePath = photo.path;
+
+      if (mounted) {
+        setState(() {
+          _statusMessage = "Please BLINK to verify liveness";
+          _isVerifyingBlink = true;
+          _eyesClosedDetected = false;
+          _isDetecting = false; // Reset lock
+        });
+
+        // 4. Resume Stream for Blink Check
+        _startFaceDetection();
+      }
+    } catch (e) {
+      debugPrint("Capture error: $e");
+      _resetResetState("Capture failed: $e");
+    }
+  }
+
+  Future<void> _finalizeCapture() async {
+    // 5. Blink Verified - Stop Stream
+    await _cameraController!.stopImageStream();
+
+    setState(() {
+      _isVerifyingBlink = false;
+      _statusMessage = "Generating face data...";
+    });
+
+    try {
+      // 6. Generate embedding from the PREVIOUSLY captured image
+      if (_capturedImagePath != null) {
+        final embedding = await _faceService.getFaceEmbeddingFromFile(
+          _capturedImagePath!,
+        );
+
+        if (embedding != null && mounted) {
+          setState(() {
+            _capturedDescriptor = embedding;
+            _statusMessage = "Face Captured Successfully!";
+          });
+        } else {
+          _resetResetState("Failed to extract face features");
+        }
+      } else {
+        _resetResetState("Image lost");
+      }
+    } catch (e) {
+      _resetResetState("Error finalizing: $e");
+    }
+  }
+
+  void _resetResetState(String msg) {
+    // Clean file
+    _cleanupTempFile();
+
+    if (mounted) {
+      setState(() {
+        _capturedDescriptor = null;
+        _capturedImagePath = null;
+        _isVerifyingBlink = false;
+        _eyesClosedDetected = false;
+        _statusMessage = msg;
+        _isDetecting = false;
+      });
+      // Restart
+      _startFaceDetection();
+    }
+  }
+
   void _retakeFace() {
-    // Clean up the old captured image file
+    _cleanupTempFile();
+
+    setState(() {
+      _capturedDescriptor = null;
+      _capturedImagePath = null;
+      _isVerifyingBlink = false;
+      _eyesClosedDetected = false;
+      _statusMessage = "Align face to register";
+    });
+
+    // Restart the face detection stream
+    _startFaceDetection();
+  }
+
+  void _cleanupTempFile() {
     if (_capturedImagePath != null) {
       try {
         File(_capturedImagePath!).deleteSync();
       } catch (_) {}
     }
-
-    setState(() {
-      _capturedDescriptor = null;
-      _capturedImagePath = null;
-      _shouldCapture = false;
-      _statusMessage = "Align face to register";
-      _isLiveFaceDetected = false;
-    });
-
-    // Restart the face detection stream
-    _startFaceDetection();
   }
 
   Future<void> _submitRegistration() async {
@@ -260,12 +314,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     _emailController.dispose();
     _contactController.dispose();
     _addressController.dispose();
-    // Clean up temp captured image
-    if (_capturedImagePath != null) {
-      try {
-        File(_capturedImagePath!).deleteSync();
-      } catch (_) {}
-    }
+    _cleanupTempFile();
     super.dispose();
   }
 
@@ -335,11 +384,18 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
                 if (_capturedDescriptor == null)
                   ElevatedButton.icon(
-                    onPressed: _isLiveFaceDetected
-                        ? () => setState(() => _shouldCapture = true)
-                        : null,
+                    onPressed: (_isVerifyingBlink)
+                        ? null // Disable button while verifying blink
+                        : _initiateCapture,
                     icon: const Icon(Icons.camera_alt),
-                    label: const Text("Capture Face"),
+                    label: Text(
+                      _isVerifyingBlink ? "Blink to Verify..." : "Capture Face",
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _isVerifyingBlink
+                          ? Colors.grey
+                          : Colors.blue,
+                    ),
                   )
                 else
                   ElevatedButton.icon(
@@ -380,8 +436,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       return const Center(child: CircularProgressIndicator());
     }
 
-    // Show captured/frozen image after successful capture
-    if (_capturedDescriptor != null && _capturedImagePath != null) {
+    // Show captured/frozen image ONLY after full success
+    if (_capturedDescriptor != null &&
+        _capturedImagePath != null &&
+        !_isVerifyingBlink) {
       return Stack(
         children: [
           // Frozen captured face image
@@ -426,21 +484,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       );
     }
 
-    // Fallback: descriptor captured but no image (rare edge case)
-    if (_capturedDescriptor != null) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.check_circle, color: Colors.green, size: 60),
-            const SizedBox(height: 8),
-            Text(_statusMessage),
-          ],
-        ),
-      );
-    }
-
-    // Live camera preview
+    // Live camera preview (Scanning OR Blink Verification)
     return Stack(
       children: [
         CameraView(controller: _cameraController!),
@@ -450,7 +494,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             height: 200,
             decoration: BoxDecoration(
               border: Border.all(
-                color: _isLiveFaceDetected ? Colors.green : Colors.red,
+                color: _isVerifyingBlink
+                    ? (_eyesClosedDetected ? Colors.yellow : Colors.blue)
+                    : Colors.green,
                 width: 3,
               ),
             ),
@@ -465,7 +511,13 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             child: Text(
               _statusMessage,
               textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white),
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: _isVerifyingBlink
+                    ? FontWeight.bold
+                    : FontWeight.normal,
+                fontSize: _isVerifyingBlink ? 18 : 14,
+              ),
             ),
           ),
         ),

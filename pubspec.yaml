@@ -31,7 +31,7 @@ dependencies:
   flutter:
     sdk: flutter
   supabase_flutter: ^2.8.3
-  face_anti_spoofing_detector: ^0.0.2 # Not used in active liveness flow; kept for easy re-enablement
+  # face_anti_spoofing_detector: ^0.0.4 # Not used in active liveness flow; kept for easy re-enablement
   google_mlkit_face_detection: ^0.12.0
   permission_handler: ^11.3.1
   image_picker: ^1.1.2
