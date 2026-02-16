@@ -78,7 +78,10 @@ class SupabaseService {
         final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/attendance/log');
         final response = await http.post(
           url,
-          headers: {'Content-Type': 'application/json'},
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': AppConfig.mobileApiKey,
+          },
           body: jsonEncode({
             'employeeId': log['employee_id'],
             'type': log['type'],
@@ -246,7 +249,10 @@ class SupabaseService {
         final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/attendance/log');
         final response = await http.post(
           url,
-          headers: {'Content-Type': 'application/json'},
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': AppConfig.mobileApiKey,
+          },
           body: jsonEncode({
             'employeeId': employeeId,
             'type': type,
