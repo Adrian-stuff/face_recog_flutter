@@ -4,6 +4,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../services/face_service.dart';
+import '../services/sound_service.dart';
 import '../services/supabase_service.dart';
 import '../widgets/camera_view.dart';
 import 'settings_screen.dart';
@@ -27,6 +28,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   CameraController? _cameraController;
   final FaceService _faceService = FaceService();
   final SupabaseService _supabaseService = SupabaseService();
+  final SoundService _soundService = SoundService();
 
   bool _isDetecting = false;
   String _statusMessage = "Align face to register";
@@ -60,6 +62,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
     await _cameraController!.initialize();
     await _faceService.initialize();
+    await _soundService.initialize();
     if (mounted) {
       setState(() {
         if (!_faceService.isInterpreterReady) {
@@ -288,6 +291,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Employee Registered Successfully!")),
         );
+        await _soundService.playSuccess(message: "Registration Successful");
         Navigator.pop(context);
       }
     } catch (e) {
@@ -297,6 +301,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           errorMsg = '${e.message} (${e.details ?? e.hint ?? e.code})';
         }
         debugPrint('Registration error: $e');
+
+        await _soundService.playError(message: "Registration Failed");
+
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text("Registration Error: $errorMsg"),

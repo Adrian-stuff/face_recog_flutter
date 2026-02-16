@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:table_calendar/table_calendar.dart';
 import '../services/face_service.dart';
+import '../services/sound_service.dart';
 import '../services/supabase_service.dart';
 import '../widgets/real_time_clock.dart';
 import '../widgets/weather_widget.dart';
@@ -21,6 +22,7 @@ class FaceScanScreen extends StatefulWidget {
 class _FaceScanScreenState extends State<FaceScanScreen> {
   final SupabaseService _supabaseService = SupabaseService();
   final FaceService _faceService = FaceService();
+  final SoundService _soundService = SoundService();
 
   bool _isProcessing = false;
   String _statusMessage = "Loading...";
@@ -55,6 +57,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
     // Pre-warm FaceService (loads TFLite model)
     try {
       await _faceService.initialize();
+      await _soundService.initialize();
       if (mounted) setState(() => _statusMessage = "Ready");
     } catch (e) {
       debugPrint("FaceService init error: $e");
@@ -120,6 +123,9 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       // Verify face.
       final matchedEmployee = await _supabaseService.verifyFace(embedding);
       if (matchedEmployee == null) {
+        
+        await _soundService.playError(message: "Face not recognized");
+
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -142,6 +148,11 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       final similarity = matchedEmployee['similarity'];
 
       await _supabaseService.recordAttendance(employeeId, type);
+
+      // Play Success Sound
+      await _soundService.playSuccess(
+        message: "${type == 'time-in' ? 'Time In' : 'Time Out'} recorded",
+      );
 
       if (mounted) {
         final action = type == 'time-in' ? 'Time In' : 'Time Out';
@@ -168,6 +179,8 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       if (mounted) {
         // Clean up the error message
         String errorMessage = e.toString().replaceAll('Exception: ', '');
+        
+        await _soundService.playError(message: "Error: $errorMessage");
 
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
