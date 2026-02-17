@@ -123,7 +123,6 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       // Verify face.
       final matchedEmployee = await _supabaseService.verifyFace(embedding);
       if (matchedEmployee == null) {
-        
         await _soundService.playError(message: "Face not recognized");
 
         if (mounted) {
@@ -141,33 +140,113 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
         return;
       }
 
-      // Record attendance.
-      final employeeId = matchedEmployee['id'] as int;
+      // ---------------------------------------------------------
+      // CONFIRMATION STEP
+      // ---------------------------------------------------------
       final firstName = matchedEmployee['first_name'] ?? '';
       final lastName = matchedEmployee['last_name'] ?? '';
-      final similarity = matchedEmployee['similarity'];
+      final similarity = matchedEmployee['similarity']; // e.g. 0.85
 
+      // Show dialog to confirm identity
+      final confirmed = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) {
+          return AlertDialog(
+            title: const Text("Confirm Identity"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.face, size: 60, color: Colors.blue),
+                const SizedBox(height: 16),
+                Text(
+                  "Are you $firstName $lastName?",
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  "Match Confidence: ${(similarity * 100).toStringAsFixed(1)}%",
+                  style: TextStyle(color: Colors.grey[600], fontSize: 14),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text(
+                  "No, that's not me",
+                  style: TextStyle(color: Colors.red),
+                ),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(context, true),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text("Yes, it's me"),
+              ),
+            ],
+          );
+        },
+      );
+
+      if (confirmed != true) {
+        if (mounted) {
+          setState(() {
+            _isProcessing = false;
+            _statusMessage = "Ready";
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Verification cancelled by user."),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+        return;
+      }
+
+      // ---------------------------------------------------------
+      // RECORD ATTENDANCE + DATASET IMPROVEMENT
+      // ---------------------------------------------------------
+
+      final employeeId = matchedEmployee['id'] as int;
+
+      // 1. Record Attendance
       await _supabaseService.recordAttendance(employeeId, type);
 
-      // Play Success Sound
+      // 2. Play Success Sound
       await _soundService.playSuccess(
         message: "${type == 'time-in' ? 'Time In' : 'Time Out'} recorded",
       );
 
+      // 3. Improve Dataset (Fire & Forget)
+      // We don't want to block the success message if this fails, nor show an error.
+      // Only do this if online (implicit in verifyFace usually, but good to check).
+      _supabaseService
+          .saveFaceDescriptor(employeeId, embedding)
+          .then((_) {
+            debugPrint("Dataset improved for employee $employeeId");
+          })
+          .catchError((e) {
+            debugPrint("Failed to improve dataset (non-fatal): $e");
+          });
+
       if (mounted) {
         final action = type == 'time-in' ? 'Time In' : 'Time Out';
         final now = DateTime.now();
-        // Simple formatting to avoid intl dependency if not already imported,
-        // but since we added intl earlier for calendar, we can use it.
-        // Or just basic string manip to be safe/quick.
         final timeString =
             "${now.hour > 12 ? now.hour - 12 : (now.hour == 0 ? 12 : now.hour)}:${now.minute.toString().padLeft(2, '0')} ${now.hour >= 12 ? 'PM' : 'AM'}";
 
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '$action recorded for $firstName $lastName at $timeString\n'
-              'Match: ${(similarity * 100).toStringAsFixed(1)}%',
+              '$action recorded for $firstName $lastName at $timeString',
               style: const TextStyle(fontSize: 16),
             ),
             backgroundColor: Colors.green,
@@ -179,7 +258,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       if (mounted) {
         // Clean up the error message
         String errorMessage = e.toString().replaceAll('Exception: ', '');
-        
+
         await _soundService.playError(message: "Error: $errorMessage");
 
         ScaffoldMessenger.of(context).showSnackBar(

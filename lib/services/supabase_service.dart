@@ -31,6 +31,7 @@ class SupabaseService {
 
     try {
       // Fetch employees AND their face encodings
+      // We need ALL encodings, so we select the relationship
       final employees = await _client
           .from('employees')
           .select(
@@ -38,14 +39,29 @@ class SupabaseService {
           );
 
       // Transform data for local storage
-      // flatten: employee -> hasOne face_encoding -> descriptor
       final List<Map<String, dynamic>> localData = employees.map((e) {
         final encodings = e['face_encodings'] as List<dynamic>?;
+
+        // Store ALL descriptors as a JSON list of lists: [[0.1, ...], [0.2, ...]]
         String? descriptorStr;
         if (encodings != null && encodings.isNotEmpty) {
-          descriptorStr = encodings.first['descriptor'] as String?;
-          // Ensure format is [x,y,z] not string if needed,
-          // but for now we store raw string from PGVector
+          final List<List<double>> allDescriptors = [];
+          for (var enc in encodings) {
+            final desc = enc['descriptor'];
+            if (desc is String) {
+              // parse PGVector string '[1,2,3]' -> List<double>
+              final vec = desc
+                  .replaceAll('[', '')
+                  .replaceAll(']', '')
+                  .split(',')
+                  .map((e) => double.tryParse(e.trim()) ?? 0.0)
+                  .toList();
+              allDescriptors.add(vec);
+            } else if (desc is List) {
+              allDescriptors.add(List<double>.from(desc));
+            }
+          }
+          descriptorStr = jsonEncode(allDescriptors);
         }
 
         return {
@@ -53,7 +69,8 @@ class SupabaseService {
           'first_name': e['first_name'],
           'last_name': e['last_name'],
           'position': e['position'],
-          'face_features': descriptorStr, // Store vector string
+          'face_features':
+              descriptorStr, // Stores JSON string of List<List<double>>
         };
       }).toList();
 
@@ -107,12 +124,26 @@ class SupabaseService {
     int employeeId,
     List<double> embedding,
   ) async {
+    if (!await isOnline) {
+      throw Exception("Cannot update dataset while offline");
+    }
+
     try {
-      final vectorStr = '[${embedding.join(',')}]';
-      await _client.from('face_encodings').insert({
-        'employee_id': employeeId,
-        'descriptor': vectorStr,
-      });
+      final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/face-encoding');
+      final response = await http.post(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': AppConfig.mobileApiKey,
+        },
+        body: jsonEncode({'employeeId': employeeId, 'descriptor': embedding}),
+      );
+
+      if (response.statusCode != 200) {
+        throw Exception(
+          'Failed to save encoding: ${response.statusCode} ${response.body}',
+        );
+      }
     } catch (e) {
       debugPrint('Error saving face descriptor: $e');
       rethrow;
@@ -133,7 +164,7 @@ class SupabaseService {
           },
         );
 
-        final List<dynamic> results = response as List<dynamic>;
+        final List<dynamic> results = response;
         if (results.isEmpty) return null;
 
         final match = results.first as Map<String, dynamic>;
@@ -160,32 +191,61 @@ class SupabaseService {
       final featureStr = emp['face_features'] as String?;
       if (featureStr == null) continue;
 
-      // Parse vector string '[0.1, 0.2, ...]'
-      final vectorList = featureStr
-          .replaceAll('[', '')
-          .replaceAll(']', '')
-          .split(',')
-          .map((e) => double.tryParse(e.trim()) ?? 0.0)
-          .toList();
+      List<List<double>> candidateVectors = [];
 
-      if (vectorList.length != embedding.length) continue;
-
-      // Calculate Cosine Similarity
-      double dotProduct = 0.0;
-      double normA = 0.0;
-      double normB = 0.0;
-
-      for (int i = 0; i < embedding.length; i++) {
-        dotProduct += embedding[i] * vectorList[i];
-        normA += embedding[i] * embedding[i];
-        normB += vectorList[i] * vectorList[i];
+      try {
+        // Try parsing as List<List<double>> (New Format)
+        final decoded = jsonDecode(featureStr);
+        if (decoded is List) {
+          if (decoded.isNotEmpty && decoded.first is List) {
+            // It's [[...], [...]]
+            candidateVectors = (decoded as List)
+                .map((e) => List<double>.from(e))
+                .toList();
+          } else {
+            // Fallback: It might be a single list [0.1, ...] (Old Format or single vector)
+            // But wait, our sync logic now enforces List<List>.
+            // However, let's be safe. If it's a simple list of numbers, wrap it.
+            candidateVectors = [List<double>.from(decoded)];
+          }
+        }
+      } catch (e) {
+        // Fallback: maybe it's the old raw string format "[0.1, ...]"
+        // Try parsing manually
+        try {
+          final vectorList = featureStr
+              .replaceAll('[', '')
+              .replaceAll(']', '')
+              .split(',')
+              .map((e) => double.tryParse(e.trim()) ?? 0.0)
+              .toList();
+          candidateVectors = [vectorList];
+        } catch (_) {
+          continue;
+        }
       }
 
-      final score = dotProduct / (sqrt(normA) * sqrt(normB));
+      // Check ALL candidate vectors for this employee
+      for (final vectorList in candidateVectors) {
+        if (vectorList.length != embedding.length) continue;
 
-      if (score > maxScore) {
-        maxScore = score;
-        bestMatch = emp;
+        // Calculate Cosine Similarity
+        double dotProduct = 0.0;
+        double normA = 0.0;
+        double normB = 0.0;
+
+        for (int i = 0; i < embedding.length; i++) {
+          dotProduct += embedding[i] * vectorList[i];
+          normA += embedding[i] * embedding[i];
+          normB += vectorList[i] * vectorList[i];
+        }
+
+        final score = dotProduct / (sqrt(normA) * sqrt(normB));
+
+        if (score > maxScore) {
+          maxScore = score;
+          bestMatch = emp;
+        }
       }
     }
 
