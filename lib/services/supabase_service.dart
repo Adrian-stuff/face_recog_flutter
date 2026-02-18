@@ -30,38 +30,32 @@ class SupabaseService {
     if (!await isOnline) return;
 
     try {
-      // Fetch employees AND their face encodings
-      // We need ALL encodings, so we select the relationship
-      final employees = await _client
-          .from('employees')
-          .select(
-            'id, first_name, last_name, position, face_encodings(descriptor)',
-          );
+      // Use the optimized API endpoint to fetch employees with cached/limited encodings
+      final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/sync/employees');
+      final response = await http.get(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': AppConfig.mobileApiKey,
+        },
+      );
+
+      if (response.statusCode != 200) {
+        debugPrint('Sync Failed: ${response.statusCode} - ${response.body}');
+        return;
+      }
+
+      final List<dynamic> employees = jsonDecode(response.body);
 
       // Transform data for local storage
       final List<Map<String, dynamic>> localData = employees.map((e) {
-        final encodings = e['face_encodings'] as List<dynamic>?;
+        // The API returns 'face_features' as a direct list of descriptors (arrays)
+        // e.g. [[0.1, ...], [0.2, ...]] or an empty array
+        final features = e['face_features'];
 
-        // Store ALL descriptors as a JSON list of lists: [[0.1, ...], [0.2, ...]]
         String? descriptorStr;
-        if (encodings != null && encodings.isNotEmpty) {
-          final List<List<double>> allDescriptors = [];
-          for (var enc in encodings) {
-            final desc = enc['descriptor'];
-            if (desc is String) {
-              // parse PGVector string '[1,2,3]' -> List<double>
-              final vec = desc
-                  .replaceAll('[', '')
-                  .replaceAll(']', '')
-                  .split(',')
-                  .map((e) => double.tryParse(e.trim()) ?? 0.0)
-                  .toList();
-              allDescriptors.add(vec);
-            } else if (desc is List) {
-              allDescriptors.add(List<double>.from(desc));
-            }
-          }
-          descriptorStr = jsonEncode(allDescriptors);
+        if (features != null && features is List && features.isNotEmpty) {
+          descriptorStr = jsonEncode(features);
         }
 
         return {
@@ -69,8 +63,7 @@ class SupabaseService {
           'first_name': e['first_name'],
           'last_name': e['last_name'],
           'position': e['position'],
-          'face_features':
-              descriptorStr, // Stores JSON string of List<List<double>>
+          'face_features': descriptorStr,
         };
       }).toList();
 
@@ -122,8 +115,9 @@ class SupabaseService {
 
   Future<void> saveFaceDescriptor(
     int employeeId,
-    List<double> embedding,
-  ) async {
+    List<double> embedding, {
+    bool isGolden = false,
+  }) async {
     if (!await isOnline) {
       throw Exception("Cannot update dataset while offline");
     }
@@ -136,7 +130,11 @@ class SupabaseService {
           'Content-Type': 'application/json',
           'x-api-key': AppConfig.mobileApiKey,
         },
-        body: jsonEncode({'employeeId': employeeId, 'descriptor': embedding}),
+        body: jsonEncode({
+          'employeeId': employeeId,
+          'descriptor': embedding,
+          'isGolden': isGolden,
+        }),
       );
 
       if (response.statusCode != 200) {
@@ -287,7 +285,7 @@ class SupabaseService {
           .single();
 
       final employeeId = employeeResponse['id'] as int;
-      await saveFaceDescriptor(employeeId, embedding);
+      await saveFaceDescriptor(employeeId, embedding, isGolden: true);
 
       // Trigger sync to update local cache immediately
       syncEmployees();

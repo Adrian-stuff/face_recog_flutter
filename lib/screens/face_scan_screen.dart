@@ -10,7 +10,7 @@ import '../services/supabase_service.dart';
 import '../widgets/real_time_clock.dart';
 import '../widgets/weather_widget.dart';
 import 'liveness_check_screen.dart';
-import 'registration_screen.dart';
+import 'admin_dashboard_screen.dart';
 
 class FaceScanScreen extends StatefulWidget {
   const FaceScanScreen({super.key});
@@ -331,7 +331,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                   await Navigator.push(
                     context,
                     MaterialPageRoute(
-                      builder: (_) => const RegistrationScreen(),
+                      builder: (_) => const AdminDashboardScreen(),
                     ),
                   );
                 } else {

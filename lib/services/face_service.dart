@@ -349,6 +349,24 @@ class FaceService {
     }
   }
 
+  /// Calculates Cosine Similarity between two vectors
+  double compareFaces(List<double> embedding1, List<double> embedding2) {
+    if (embedding1.length != embedding2.length) return -1.0;
+
+    double dotProduct = 0.0;
+    double normA = 0.0;
+    double normB = 0.0;
+
+    for (int i = 0; i < embedding1.length; i++) {
+      dotProduct += embedding1[i] * embedding2[i];
+      normA += embedding1[i] * embedding1[i];
+      normB += embedding2[i] * embedding2[i];
+    }
+
+    if (normA == 0 || normB == 0) return 0.0;
+    return dotProduct / (sqrt(normA) * sqrt(normB));
+  }
+
   // ... (keep _isValidCameraImage and other helpers)
 }
 

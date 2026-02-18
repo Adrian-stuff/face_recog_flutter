@@ -80,6 +80,16 @@ class LocalDatabaseService {
     return await db.query('employees');
   }
 
+  Future<Map<String, dynamic>?> getEmployee(int id) async {
+    final db = await database;
+    final results = await db.query(
+      'employees',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    return results.isNotEmpty ? results.first : null;
+  }
+
   // --- Offline Attendance Methods ---
 
   Future<bool> hasLogForToday(int employeeId, String type) async {
