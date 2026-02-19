@@ -8,6 +8,7 @@ import 'dart:math';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import '../config/app_config.dart';
 import 'local_database_service.dart';
+import 'face_service.dart';
 
 class SupabaseService {
   static final SupabaseService _instance = SupabaseService._internal();
@@ -397,23 +398,72 @@ class SupabaseService {
     }
   }
 
-  Future<int> registerEmployeeWithPhoto(
+  Future<int> registerEmployeeWithPhotos(
     Map<String, dynamic> employeeData,
-    List<double> embedding,
-    File photoFile,
+    List<String> photoPaths,
   ) async {
     if (!await isOnline) {
       throw Exception("Registration requires internet connection");
     }
 
+    if (photoPaths.isEmpty) {
+      throw Exception("No photos provided for registration");
+    }
+
     int? employeeId;
     try {
-      employeeId = await registerEmployee(employeeData, embedding);
-      await uploadEmployeePhoto(employeeId, photoFile);
+      // 1. Insert Employee Record (without embedding initially, or we insert empty)
+      // We reuse registerEmployee but we need a dummy embedding or change logic.
+      // But registerEmployee takes an embedding.
+      // Let's modify the flow: Insert employee separately first.
+
+      final employeeResponse = await _client
+          .from('employees')
+          .insert(employeeData)
+          .select()
+          .single();
+
+      employeeId = employeeResponse['id'] as int;
+
+      // 2. Upload Profile Picture (Use the first photo as primary)
+      try {
+        await uploadEmployeePhoto(employeeId, File(photoPaths.first));
+      } catch (e) {
+        debugPrint("Warning: Failed to upload profile picture: $e");
+        // Non-fatal? Maybe. But we want a profile pic.
+      }
+
+      // 3. Process All Photos -> Generate Embeddings -> Save as Golden
+      final FaceService faceService = FaceService();
+      // Ensure initialized
+      await faceService.initialize();
+
+      int successfulEncodings = 0;
+
+      for (final path in photoPaths) {
+        try {
+          final embedding = await faceService.getFaceEmbeddingFromFile(path);
+          if (embedding != null) {
+            await saveFaceDescriptor(employeeId, embedding, isGolden: true);
+            successfulEncodings++;
+          }
+        } catch (e) {
+          debugPrint("Error processing photo $path: $e");
+        }
+      }
+
+      if (successfulEncodings == 0) {
+        throw Exception(
+          "Failed to extract face data from any of the provided photos",
+        );
+      }
+
+      // 4. Trigger Sync
+      syncEmployees(); // Fire and forget or await? best to await if we want immediate feedback
 
       return employeeId;
     } catch (e) {
-      debugPrint('Registration with photo failed: $e');
+      debugPrint('Registration with photos failed: $e');
       if (employeeId != null) {
         try {
           await _client.from('employees').delete().eq('id', employeeId);

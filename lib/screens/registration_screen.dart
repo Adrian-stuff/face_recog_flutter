@@ -1,12 +1,11 @@
 import 'dart:io';
 
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../services/face_service.dart';
 import '../services/sound_service.dart';
 import '../services/supabase_service.dart';
-import '../widgets/camera_view.dart';
+import 'multi_angle_capture_screen.dart';
 import 'settings_screen.dart';
 
 class RegistrationScreen extends StatefulWidget {
@@ -25,236 +24,64 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   final _contactController = TextEditingController();
   final _addressController = TextEditingController();
 
-  CameraController? _cameraController;
-  final FaceService _faceService = FaceService();
   final SupabaseService _supabaseService = SupabaseService();
   final SoundService _soundService = SoundService();
+  final FaceService _faceService = FaceService();
 
-  bool _isDetecting = false;
-  String _statusMessage = "Align face to register";
-  List<double>? _capturedDescriptor;
-  String? _capturedImagePath; // Path to the frozen capture image
-
-  // Blink Verification State
-  bool _isVerifyingBlink = false;
-  bool _eyesClosedDetected = false;
-  bool _isFaceAligned = false;
+  List<String> _capturedImagePaths = [];
+  bool _isRegistering = false;
 
   @override
   void initState() {
     super.initState();
-    _initializeCamera();
+    _initServices();
   }
 
-  Future<void> _initializeCamera() async {
-    final cameras = await availableCameras();
-    final frontCamera = cameras.firstWhere(
-      (camera) => camera.lensDirection == CameraLensDirection.front,
-      orElse: () => cameras.first,
-    );
-
-    _cameraController = CameraController(
-      frontCamera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
-
-    await _cameraController!.initialize();
-    await _faceService.initialize();
+  Future<void> _initServices() async {
     await _soundService.initialize();
-    if (mounted) {
-      setState(() {
-        if (!_faceService.isInterpreterReady) {
-          _statusMessage =
-              "⚠ Model failed to load: ${_faceService.interpreterErrorMessage}";
-        }
-      });
-      _startFaceDetection();
-    }
+    await _faceService.initialize();
   }
 
-  void _startFaceDetection() {
-    if (_cameraController == null ||
-        !_cameraController!.value.isInitialized ||
-        _cameraController!.value.isStreamingImages) {
-      return;
-    }
+  Future<void> _startMultiAngleCapture() async {
+    final result = await Navigator.push<List<String>?>(
+      context,
+      MaterialPageRoute(builder: (_) => const MultiAngleCaptureScreen()),
+    );
 
-    _cameraController!.startImageStream((image) async {
-      if (_isDetecting) return;
-      _isDetecting = true;
-
-      try {
-        final result = await _faceService.processImage(
-          image,
-          _cameraController!.description.sensorOrientation,
-        );
-
-        if (mounted) {
-          if (result['error'] != null) {
-            final error = result['error'];
-            setState(() {
-              _isFaceAligned = false;
-              if (error == 'No face detected') {
-                if (!_isVerifyingBlink) _statusMessage = "No face detected";
-              } else if (error == 'Multiple faces detected') {
-                _statusMessage = "Multiple faces detected - Only one allowed";
-              }
-            });
-          } else {
-            // Face Found
-            if (!_isVerifyingBlink && _capturedDescriptor == null) {
-              setState(() {
-                _isFaceAligned = true;
-                _statusMessage = "Face Detected - Ready to Capture";
-              });
-            } else if (_isVerifyingBlink) {
-              // --- Blink Verification Logic ---
-              final double leftEye = result['leftEyeOpen'] ?? 1.0;
-              final double rightEye = result['rightEyeOpen'] ?? 1.0;
-
-              // Thresholds (tunable)
-              const double closeThreshold = 0.2;
-              const double openThreshold = 0.8;
-
-              if (leftEye < closeThreshold && rightEye < closeThreshold) {
-                _eyesClosedDetected = true;
-              }
-
-              if (_eyesClosedDetected &&
-                  (leftEye > openThreshold && rightEye > openThreshold)) {
-                // Blink Completed!
-                _finalizeCapture();
-              }
-            }
-          }
-        }
-      } catch (e) {
-        debugPrint("Error processing image: $e");
-      } finally {
-        _isDetecting = false;
-      }
-    });
-  }
-
-  Future<void> _initiateCapture() async {
-    if (_cameraController == null || !_cameraController!.value.isInitialized)
-      return;
-
-    setState(() {
-      _statusMessage = "Capturing...";
-      _isDetecting = true; // Block stream processing mainly
-    });
-
-    // 1. Pause Stream (implicitly handled by taking picture logic usually, but let's be safe)
-    await _cameraController!.stopImageStream();
-
-    // 2. Take Picture
-    try {
-      final XFile photo = await _cameraController!.takePicture();
-
-      // 3. Save, but don't finalize yet
-      _capturedImagePath = photo.path;
-
+    if (result != null && result.isNotEmpty) {
       if (mounted) {
         setState(() {
-          _statusMessage = "Please BLINK to verify liveness";
-          _isVerifyingBlink = true;
-          _eyesClosedDetected = false;
-          _isDetecting = false; // Reset lock
+          _capturedImagePaths = result;
         });
-
-        // 4. Resume Stream for Blink Check
-        _startFaceDetection();
-      }
-    } catch (e) {
-      debugPrint("Capture error: $e");
-      _resetResetState("Capture failed: $e");
-    }
-  }
-
-  Future<void> _finalizeCapture() async {
-    // 5. Blink Verified - Stop Stream
-    await _cameraController!.stopImageStream();
-
-    setState(() {
-      _isVerifyingBlink = false;
-      _statusMessage = "Generating face data...";
-    });
-
-    try {
-      // 6. Generate embedding from the PREVIOUSLY captured image
-      if (_capturedImagePath != null) {
-        final embedding = await _faceService.getFaceEmbeddingFromFile(
-          _capturedImagePath!,
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Face scan completed successfully!"),
+            backgroundColor: Colors.green,
+          ),
         );
-
-        if (embedding != null && mounted) {
-          setState(() {
-            _capturedDescriptor = embedding;
-            _statusMessage = "Face Captured Successfully!";
-          });
-        } else {
-          _resetResetState("Failed to extract face features");
-        }
-      } else {
-        _resetResetState("Image lost");
       }
-    } catch (e) {
-      _resetResetState("Error finalizing: $e");
-    }
-  }
-
-  void _resetResetState(String msg) {
-    // Clean file
-    _cleanupTempFile();
-
-    if (mounted) {
-      setState(() {
-        _capturedDescriptor = null;
-        _capturedImagePath = null;
-        _isVerifyingBlink = false;
-        _eyesClosedDetected = false;
-        _statusMessage = msg;
-        _isDetecting = false;
-      });
-      // Restart
-      _startFaceDetection();
     }
   }
 
   void _retakeFace() {
-    _cleanupTempFile();
-
+    // Delete old temp files? Ideally yes, but OS cleans cache.
+    // We can just clear the list.
     setState(() {
-      _capturedDescriptor = null;
-      _capturedImagePath = null;
-      _isVerifyingBlink = false;
-      _eyesClosedDetected = false;
-      _statusMessage = "Align face to register";
+      _capturedImagePaths = [];
     });
-
-    // Restart the face detection stream
-    _startFaceDetection();
-  }
-
-  void _cleanupTempFile() {
-    if (_capturedImagePath != null) {
-      try {
-        File(_capturedImagePath!).deleteSync();
-      } catch (_) {}
-    }
+    _startMultiAngleCapture();
   }
 
   Future<void> _submitRegistration() async {
     if (!_formKey.currentState!.validate()) return;
-    if (_capturedDescriptor == null) {
+    if (_capturedImagePaths.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please capture a face first.")),
+        const SnackBar(content: Text("Please complete the face scan first.")),
       );
       return;
     }
+
+    setState(() => _isRegistering = true);
 
     try {
       final employeeData = {
@@ -266,33 +93,42 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         'address': _addressController.text,
       };
 
-      if (_capturedImagePath != null) {
-        // Atomic Flow: Insert -> Upload -> Rollback if fail
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Registering & Uploading...")),
-          );
-        }
-
-        await _supabaseService.registerEmployeeWithPhoto(
-          employeeData,
-          _capturedDescriptor!,
-          File(_capturedImagePath!),
-        );
-      } else {
-        // Fallback (shouldn't happen given validation)
-        await _supabaseService.registerEmployee(
-          employeeData,
-          _capturedDescriptor!,
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Registering Employee & Processing Faces..."),
+            duration: Duration(seconds: 2),
+          ),
         );
       }
 
+      await _supabaseService.registerEmployeeWithPhotos(
+        employeeData,
+        _capturedImagePaths,
+      );
+
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Employee Registered Successfully!")),
-        );
         await _soundService.playSuccess(message: "Registration Successful");
-        Navigator.pop(context);
+
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            title: const Text("Success"),
+            content: const Text(
+              "Employee registered with multi-angle face data.",
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(ctx); // Close dialog
+                  Navigator.pop(context); // Close screen
+                },
+                child: const Text("OK"),
+              ),
+            ],
+          ),
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -306,25 +142,25 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text("Registration Error: $errorMsg"),
+            content: Text("Error: $errorMsg"),
             backgroundColor: Colors.red,
-            duration: const Duration(seconds: 8),
+            duration: const Duration(seconds: 5),
           ),
         );
       }
+    } finally {
+      if (mounted) setState(() => _isRegistering = false);
     }
   }
 
   @override
   void dispose() {
-    _cameraController?.dispose();
     _firstNameController.dispose();
     _lastNameController.dispose();
     _positionController.dispose();
     _emailController.dispose();
     _contactController.dispose();
     _addressController.dispose();
-    _cleanupTempFile();
     super.dispose();
   }
 
@@ -351,6 +187,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           child: Form(
             key: _formKey,
             child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 // Form Fields
                 TextFormField(
@@ -382,156 +219,103 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                   controller: _addressController,
                   decoration: const InputDecoration(labelText: "Address"),
                 ),
-                const SizedBox(height: 20),
+                const SizedBox(height: 30),
 
-                // Camera / Captured Image Section
-                SizedBox(
-                  height: 300,
-                  width: double.infinity,
-                  child: _buildCameraSection(),
-                ),
-                const SizedBox(height: 10),
-
-                if (_capturedDescriptor == null)
-                  ElevatedButton.icon(
-                    onPressed: (_isVerifyingBlink || !_isFaceAligned)
-                        ? null // Disable button while verifying blink OR face not valid
-                        : _initiateCapture,
-                    icon: const Icon(Icons.camera_alt),
-                    label: Text(
-                      _isVerifyingBlink ? "Blink to Verify..." : "Capture Face",
+                // Photos Section
+                if (_capturedImagePaths.isEmpty)
+                  Container(
+                    height: 150,
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade200,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: Colors.grey.shade400,
+                        style: BorderStyle.solid,
+                      ),
                     ),
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.face, size: 48, color: Colors.grey),
+                          const SizedBox(height: 8),
+                          const Text(
+                            "No face data captured",
+                            style: TextStyle(color: Colors.grey),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                else
+                  SizedBox(
+                    height: 120,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: _capturedImagePaths.length,
+                      separatorBuilder: (_, __) => const SizedBox(width: 8),
+                      itemBuilder: (ctx, index) {
+                        return ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Image.file(
+                            File(_capturedImagePaths[index]),
+                            width: 100,
+                            height: 100,
+                            fit: BoxFit.cover,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+
+                const SizedBox(height: 16),
+
+                if (_capturedImagePaths.isEmpty)
+                  ElevatedButton.icon(
+                    onPressed: _isRegistering ? null : _startMultiAngleCapture,
+                    icon: const Icon(Icons.camera_enhance),
+                    label: const Text("START FACE SCAN"),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: _isVerifyingBlink
-                          ? Colors.grey
-                          : Colors.blue,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      backgroundColor: Colors.blueAccent,
+                      foregroundColor: Colors.white,
                     ),
                   )
                 else
                   ElevatedButton.icon(
-                    onPressed: _retakeFace,
+                    onPressed: _isRegistering ? null : _retakeFace,
                     icon: const Icon(Icons.refresh),
-                    label: const Text("Retake Face"),
+                    label: const Text("RETAKE SCAN"),
                     style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
                       backgroundColor: Colors.orange,
+                      foregroundColor: Colors.white,
                     ),
                   ),
 
-                const SizedBox(height: 30),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: _submitRegistration,
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                      backgroundColor: Colors.blue[900],
-                    ),
-                    child: const Text(
-                      "REGISTER EMPLOYEE",
-                      style: TextStyle(color: Colors.white),
-                    ),
+                const SizedBox(height: 40),
+                ElevatedButton(
+                  onPressed: _isRegistering ? null : _submitRegistration,
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 18),
+                    backgroundColor: Colors.blue[900],
+                    foregroundColor: Colors.white,
                   ),
+                  child: _isRegistering
+                      ? const CircularProgressIndicator(color: Colors.white)
+                      : const Text(
+                          "COMPLETE REGISTRATION",
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                 ),
               ],
             ),
           ),
         ),
       ),
-    );
-  }
-
-  Widget _buildCameraSection() {
-    // Camera not ready yet
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    // Show captured/frozen image ONLY after full success
-    if (_capturedDescriptor != null &&
-        _capturedImagePath != null &&
-        !_isVerifyingBlink) {
-      return Stack(
-        children: [
-          // Frozen captured face image
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: SizedBox.expand(
-              child: Image.file(File(_capturedImagePath!), fit: BoxFit.cover),
-            ),
-          ),
-          // Success overlay
-          Center(
-            child: Container(
-              width: 200,
-              height: 200,
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.green, width: 3),
-                borderRadius: BorderRadius.circular(4),
-              ),
-              child: const Center(
-                child: Icon(Icons.check_circle, color: Colors.green, size: 60),
-              ),
-            ),
-          ),
-          // Status bar
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: Container(
-              width: double.infinity,
-              color: Colors.black54,
-              padding: const EdgeInsets.all(8),
-              child: Text(
-                _statusMessage,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ),
-        ],
-      );
-    }
-
-    // Live camera preview (Scanning OR Blink Verification)
-    return Stack(
-      children: [
-        CameraView(controller: _cameraController!),
-        Center(
-          child: Container(
-            width: 200,
-            height: 200,
-            decoration: BoxDecoration(
-              border: Border.all(
-                color: _isVerifyingBlink
-                    ? (_eyesClosedDetected ? Colors.yellow : Colors.blue)
-                    : Colors.green,
-                width: 3,
-              ),
-            ),
-          ),
-        ),
-        Align(
-          alignment: Alignment.bottomCenter,
-          child: Container(
-            width: double.infinity,
-            color: Colors.black54,
-            padding: const EdgeInsets.all(8),
-            child: Text(
-              _statusMessage,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: Colors.white,
-                fontWeight: _isVerifyingBlink
-                    ? FontWeight.bold
-                    : FontWeight.normal,
-                fontSize: _isVerifyingBlink ? 18 : 14,
-              ),
-            ),
-          ),
-        ),
-      ],
     );
   }
 }
