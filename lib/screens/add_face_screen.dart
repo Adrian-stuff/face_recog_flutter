@@ -69,79 +69,79 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
 
     setState(() {
       _isProcessing = true;
-      _statusMessage = "Verifying identity...";
+      _statusMessage = "Validating all angles...";
     });
 
     try {
-      // 1. Generate Embedding for the Primary (First) Photo
-      // We assume the first photo is "Center" or at least a good reference.
-      final primaryPath = _capturedImagePaths.first;
-      final primaryEmbedding = await _faceService.getFaceEmbeddingFromFile(
-        primaryPath,
-      );
+      // 1. Validate ALL photos first
+      List<List<double>> validatedEmbeddings = [];
+      final labels = ["Center", "Left", "Right", "Up", "Down"];
 
-      if (primaryEmbedding == null) {
-        _showError(
-          "Could not extract face features from the primary photo. Please retake.",
-        );
-        return;
+      for (int i = 0; i < _capturedImagePaths.length; i++) {
+        final path = _capturedImagePaths[i];
+        final label = i < labels.length ? labels[i] : "Image #${i + 1}";
+
+        setState(() {
+          _statusMessage = "Analyzing $label...";
+        });
+
+        final embedding = await _faceService.getFaceEmbeddingFromFile(path);
+
+        if (embedding == null) {
+          _showError("No face detected in $label photo. Please retake.");
+          return; // Abort immediately
+        }
+        validatedEmbeddings.add(embedding);
       }
 
-      // 2. Verify Identity against THIS employee's existing encodings
+      // 2. Verify Identity against THIS employee's existing encodings (using Primary/Center)
+      final primaryEmbedding = validatedEmbeddings.first;
       final existingFeatures = widget.employee['face_features'];
+
       if (existingFeatures == null) {
-        // If employee has no existing faces, we might want to ALLOW this as their first "onboarding"
-        // But for "Adding" to existing, we usually expect verification.
-        // Let's allow it but warn, or strictly enforce?
-        // Given "Improve Dataset", usually they already exist.
-        // But if they were imported via CSV without photos, this is how they get their first one.
-        // So we should ALLOW if empty, but VERIFY if exists.
         debugPrint("No existing face data. Skipping verification.");
       } else {
         // Only verify if NOT replacing the dataset
         if (!isReplacement) {
-          bool isMatch = await _verifyMatch(primaryEmbedding, existingFeatures);
-          if (!isMatch) {
+          setState(() => _statusMessage = "Verifying identity...");
+
+          double score = await _verifyMatch(primaryEmbedding, existingFeatures);
+
+          // If score is -1, it means we have existingFeatures string but no valid vectors (empty list)
+          // We should allow this as "first valid face"
+          if (score == -1.0) {
+            debugPrint(
+              "Existing data invalid or empty. Treating as fresh start.",
+            );
+          } else if (score < 0.65) {
             _showError(
-              "Identity Verification Failed! Face does not match existing records.",
+              "Identity Verification Failed! Score: ${(score * 100).toStringAsFixed(1)}%. Center face does not match existing records.",
             );
             return;
           }
         }
       }
 
-      // 2.5 If Replacement, Delete Old Encodings
+      // 3. If Replacement, Delete Old Encodings
       if (isReplacement) {
         setState(() => _statusMessage = "Deleting old dataset...");
         await _supabaseService.deleteFaceEncodings(widget.employee['id']);
       }
 
-      // 3. Save ALL photos as Golden Records
+      // 4. Save ALL validated embeddings
       setState(
         () => _statusMessage =
-            "Verified! Processing ${_capturedImagePaths.length} photos...",
+            "Verified! Saving ${validatedEmbeddings.length} photos...",
       );
 
       int savedCount = 0;
-      for (int i = 0; i < _capturedImagePaths.length; i++) {
-        final path = _capturedImagePaths[i];
-
-        // We reuse the primary embedding for the first one to save time
-        List<double>? embedding;
-        if (i == 0) {
-          embedding = primaryEmbedding;
-        } else {
-          embedding = await _faceService.getFaceEmbeddingFromFile(path);
-        }
-
-        if (embedding != null) {
-          await _supabaseService.saveFaceDescriptor(
-            widget.employee['id'],
-            embedding,
-            isGolden: true,
-          );
-          savedCount++;
-        }
+      for (final embedding in validatedEmbeddings) {
+        await _supabaseService.saveFaceDescriptor(
+          widget.employee['id'],
+          embedding,
+          isGolden: true,
+        );
+        savedCount++;
       }
 
       if (savedCount > 0) {
@@ -158,7 +158,7 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
           Navigator.pop(context, true); // Return success
         }
       } else {
-        _showError("Failed to save any face records.");
+        _showError("Failed to save face records.");
       }
     } catch (e) {
       _showError("Error: $e");
@@ -169,7 +169,7 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
     }
   }
 
-  Future<bool> _verifyMatch(
+  Future<double> _verifyMatch(
     List<double> newEmbedding,
     dynamic existingFeatures,
   ) async {
@@ -186,7 +186,13 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
       }
     } catch (e) {
       debugPrint("Error parsing existing features: $e");
-      return false;
+      // If we can't parse, we can't verify.
+      // Option: Return 1.0 (allow) or 0.0 (deny) or -1.0 (skip/empty)
+      return -1.0;
+    }
+
+    if (existingVectors.isEmpty) {
+      return -1.0; // No valid vectors found
     }
 
     // Strict check for "Add Face" to prevent poisoning the dataset
@@ -197,9 +203,7 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
     }
 
     debugPrint("Verification Max Score: $maxScore");
-
-    // Threshold 0.65 for "somewhat identical"
-    return maxScore >= 0.65;
+    return maxScore;
   }
 
   void _showError(String msg) {

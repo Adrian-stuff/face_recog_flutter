@@ -504,4 +504,187 @@ class SupabaseService {
       rethrow;
     }
   }
+
+  // ---------------------------------------------------------
+  // Employee Selection & Photo Fetching
+  // ---------------------------------------------------------
+
+  /// Fetches employees with photo URLs for the searchable selector.
+  /// Constructs photo URLs from the employee-photos storage bucket.
+  Future<List<Map<String, dynamic>>> fetchEmployeesWithPhotos() async {
+    try {
+      // Fetch employees from Supabase directly
+      final response = await _client
+          .from('employees')
+          .select('id, first_name, last_name, position, image_url')
+          .order('first_name', ascending: true);
+
+      final List<Map<String, dynamic>> employees = [];
+
+      for (final emp in response) {
+        final empId = emp['id'] as int;
+        String? photoUrl = emp['image_url'] as String?;
+
+        // If no image_url, try to get the first photo from storage bucket
+        if (photoUrl == null || photoUrl.isEmpty) {
+          try {
+            final files = await _client.storage
+                .from('employee-photos')
+                .list(
+                  path: '$empId',
+                  searchOptions: const SearchOptions(limit: 1),
+                );
+
+            if (files.isNotEmpty) {
+              photoUrl = _client.storage
+                  .from('employee-photos')
+                  .getPublicUrl('$empId/${files.first.name}');
+            }
+          } catch (e) {
+            debugPrint('Could not fetch photo for employee $empId: $e');
+          }
+        }
+
+        employees.add({
+          'id': empId,
+          'first_name': emp['first_name'] ?? '',
+          'last_name': emp['last_name'] ?? '',
+          'position': emp['position'] ?? '',
+          'photo_url': photoUrl,
+        });
+      }
+
+      return employees;
+    } catch (e) {
+      debugPrint('Error fetching employees with photos: $e');
+      // Fallback to local DB
+      final localEmployees = await _localDb.getAllEmployees();
+      return localEmployees
+          .map(
+            (emp) => <String, dynamic>{
+              'id': emp['id'],
+              'first_name': emp['first_name'] ?? '',
+              'last_name': emp['last_name'] ?? '',
+              'position': emp['position'] ?? '',
+              'photo_url': null,
+            },
+          )
+          .toList();
+    }
+  }
+
+  /// Verifies a face embedding against ALL encodings of a specific employee.
+  /// Returns the best similarity score, or null if no match.
+  Future<Map<String, dynamic>?> verifyFaceAgainstEmployee(
+    List<double> embedding,
+    int employeeId,
+  ) async {
+    if (await isOnline) {
+      // ONLINE: Use pgvector RPC to match against a specific employee
+      try {
+        final vectorStr = '[${embedding.join(',')}]';
+        final response = await _client.rpc(
+          'match_face',
+          params: {
+            'query_embedding': vectorStr,
+            'match_threshold':
+                0.6, // Lower threshold since we know who to expect
+            'match_count':
+                5, // Get top matches to check if our employee is among them
+          },
+        );
+
+        final List<dynamic> results = response;
+        // Find the match for our specific employee
+        for (final match in results) {
+          if (match['employee_id'] == employeeId) {
+            return {
+              'id': match['employee_id'],
+              'first_name': match['first_name'],
+              'last_name': match['last_name'],
+              'position': match['position'],
+              'similarity': match['similarity'],
+            };
+          }
+        }
+
+        // Employee not in results — face doesn't match
+        return null;
+      } catch (e) {
+        debugPrint('Online targeted verification failed: $e');
+        // Fallback to offline
+      }
+    }
+
+    // OFFLINE: Local Cosine Similarity against the specific employee
+    debugPrint(
+      'Using Offline Targeted Verification for employee $employeeId...',
+    );
+    final emp = await _localDb.getEmployee(employeeId);
+    if (emp == null) return null;
+
+    final featureStr = emp['face_features'] as String?;
+    if (featureStr == null) return null;
+
+    List<List<double>> candidateVectors = [];
+
+    try {
+      final decoded = jsonDecode(featureStr);
+      if (decoded is List) {
+        if (decoded.isNotEmpty && decoded.first is List) {
+          candidateVectors = (decoded as List)
+              .map((e) => List<double>.from(e))
+              .toList();
+        } else {
+          candidateVectors = [List<double>.from(decoded)];
+        }
+      }
+    } catch (e) {
+      try {
+        final vectorList = featureStr
+            .replaceAll('[', '')
+            .replaceAll(']', '')
+            .split(',')
+            .map((e) => double.tryParse(e.trim()) ?? 0.0)
+            .toList();
+        candidateVectors = [vectorList];
+      } catch (_) {
+        return null;
+      }
+    }
+
+    double maxScore = -1.0;
+
+    // Check ALL candidate vectors for this employee
+    for (final vectorList in candidateVectors) {
+      if (vectorList.length != embedding.length) continue;
+
+      double dotProduct = 0.0;
+      double normA = 0.0;
+      double normB = 0.0;
+
+      for (int i = 0; i < embedding.length; i++) {
+        dotProduct += embedding[i] * vectorList[i];
+        normA += embedding[i] * embedding[i];
+        normB += vectorList[i] * vectorList[i];
+      }
+
+      final score = dotProduct / (sqrt(normA) * sqrt(normB));
+      if (score > maxScore) {
+        maxScore = score;
+      }
+    }
+
+    if (maxScore >= 0.6) {
+      return {
+        'id': emp['id'],
+        'first_name': emp['first_name'],
+        'last_name': emp['last_name'],
+        'position': emp['position'],
+        'similarity': maxScore,
+      };
+    }
+
+    return null;
+  }
 }

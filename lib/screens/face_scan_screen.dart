@@ -9,6 +9,7 @@ import '../services/sound_service.dart';
 import '../services/supabase_service.dart';
 import '../widgets/real_time_clock.dart';
 import '../widgets/weather_widget.dart';
+import '../widgets/searchable_employee_selector.dart';
 import 'liveness_check_screen.dart';
 import 'admin_dashboard_screen.dart';
 
@@ -33,6 +34,11 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
   CalendarFormat _calendarFormat = CalendarFormat.month;
   DateTime _focusedDay = DateTime.now();
   DateTime? _selectedDay;
+
+  // Employee selection state
+  List<Map<String, dynamic>> _employees = [];
+  Map<String, dynamic>? _selectedEmployee;
+  bool _isLoadingEmployees = true;
 
   @override
   void initState() {
@@ -67,10 +73,63 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
     // Trigger background sync
     _supabaseService.syncEmployees();
     _supabaseService.syncLogs();
+
+    // Load employees for selector
+    _loadEmployees();
+  }
+
+  Future<void> _loadEmployees() async {
+    setState(() => _isLoadingEmployees = true);
+    try {
+      final employees = await _supabaseService.fetchEmployeesWithPhotos();
+      if (mounted) {
+        setState(() {
+          _employees = employees;
+          _isLoadingEmployees = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error loading employees: $e');
+      if (mounted) {
+        setState(() => _isLoadingEmployees = false);
+      }
+    }
+  }
+
+  void _openEmployeeSelector() async {
+    final selected = await SearchableEmployeeSelector.show(context, _employees);
+    if (selected != null && mounted) {
+      setState(() => _selectedEmployee = selected);
+    }
   }
 
   Future<void> _recordAttendance(String type) async {
     if (_isProcessing) return;
+
+    // Require employee selection
+    if (_selectedEmployee == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Row(
+            children: [
+              Icon(Icons.person_search, color: Colors.white),
+              SizedBox(width: 8),
+              Text("Please select an employee first"),
+            ],
+          ),
+          backgroundColor: Colors.orange.shade700,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+      );
+      return;
+    }
+
+    final employeeId = _selectedEmployee!['id'] as int;
+    final firstName = _selectedEmployee!['first_name'] ?? '';
+    final lastName = _selectedEmployee!['last_name'] ?? '';
 
     setState(() {
       _isProcessing = true;
@@ -120,16 +179,41 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
         return;
       }
 
-      // Verify face.
-      final matchedEmployee = await _supabaseService.verifyFace(embedding);
-      if (matchedEmployee == null) {
-        await _soundService.playError(message: "Face not recognized");
+      // Verify face against the SELECTED employee (all their encodings)
+      setState(
+        () => _statusMessage = "Matching face against $firstName $lastName...",
+      );
+
+      final matchResult = await _supabaseService.verifyFaceAgainstEmployee(
+        embedding,
+        employeeId,
+      );
+
+      if (matchResult == null) {
+        await _soundService.playError(
+          message: "Face does not match $firstName $lastName",
+        );
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text("Face not recognized."),
-              backgroundColor: Colors.red,
+            SnackBar(
+              content: Row(
+                children: const [
+                  Icon(Icons.warning_amber_rounded, color: Colors.white),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      "Face does not match the selected employee. Please try again or select the correct employee.",
+                    ),
+                  ),
+                ],
+              ),
+              backgroundColor: Colors.red.shade700,
+              duration: const Duration(seconds: 5),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
           );
         }
@@ -140,87 +224,10 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
         return;
       }
 
-      // ---------------------------------------------------------
-      // CONFIRMATION STEP
-      // ---------------------------------------------------------
-      final firstName = matchedEmployee['first_name'] ?? '';
-      final lastName = matchedEmployee['last_name'] ?? '';
-      final similarity = matchedEmployee['similarity']; // e.g. 0.85
+      // Face matched! Record attendance + improve dataset
+      final similarity = matchResult['similarity'];
 
-      // Show dialog to confirm identity
-      final confirmed = await showDialog<bool>(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) {
-          return AlertDialog(
-            title: const Text("Confirm Identity"),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.face, size: 60, color: Colors.blue),
-                const SizedBox(height: 16),
-                Text(
-                  "Are you $firstName $lastName?",
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  "Match Confidence: ${(similarity * 100).toStringAsFixed(1)}%",
-                  style: TextStyle(color: Colors.grey[600], fontSize: 14),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text(
-                  "No, that's not me",
-                  style: TextStyle(color: Colors.red),
-                ),
-              ),
-              ElevatedButton(
-                onPressed: () => Navigator.pop(context, true),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.green,
-                  foregroundColor: Colors.white,
-                ),
-                child: const Text("Yes, it's me"),
-              ),
-            ],
-          );
-        },
-      );
-
-      if (confirmed != true) {
-        if (mounted) {
-          setState(() {
-            _isProcessing = false;
-            _statusMessage = "Ready";
-          });
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text("Verification cancelled by user."),
-              backgroundColor: Colors.orange,
-            ),
-          );
-        }
-        return;
-      }
-
-      // ---------------------------------------------------------
-      // RECORD ATTENDANCE + DATASET IMPROVEMENT
-      // ---------------------------------------------------------
-
-      final employeeId = matchedEmployee['id'] as int;
-
-      // 1. Improve Dataset (Fire & Forget)
-      // We do this BEFORE recording attendance so that even if attendance check fails
-      // (e.g. users already timed in), we still capture the face data to improve accuracy.
-      // This helps build a better dataset over time.
+      // Improve Dataset (Fire & Forget)
       if (_isConnected) {
         _supabaseService
             .saveFaceDescriptor(employeeId, embedding)
@@ -232,10 +239,10 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
             });
       }
 
-      // 2. Record Attendance
+      // Record Attendance
       await _supabaseService.recordAttendance(employeeId, type);
 
-      // 3. Play Success Sound
+      // Play Success Sound
       await _soundService.playSuccess(
         message: "${type == 'time-in' ? 'Time In' : 'Time Out'} recorded",
       );
@@ -246,16 +253,83 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
         final timeString =
             "${now.hour > 12 ? now.hour - 12 : (now.hour == 0 ? 12 : now.hour)}:${now.minute.toString().padLeft(2, '0')} ${now.hour >= 12 ? 'PM' : 'AM'}";
 
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '$action recorded for $firstName $lastName at $timeString',
-              style: const TextStyle(fontSize: 16),
+        // Show success dialog
+        await showDialog(
+          context: context,
+          barrierDismissible: true,
+          builder: (ctx) => AlertDialog(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
             ),
-            backgroundColor: Colors.green,
-            duration: const Duration(seconds: 4),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.green.shade50,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    Icons.check_circle_rounded,
+                    size: 56,
+                    color: Colors.green.shade600,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  '$action Recorded!',
+                  style: const TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '$firstName $lastName',
+                  style: TextStyle(
+                    fontSize: 17,
+                    color: Colors.grey[700],
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  timeString,
+                  style: TextStyle(fontSize: 15, color: Colors.grey[500]),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Match: ${(similarity * 100).toStringAsFixed(1)}%',
+                  style: TextStyle(fontSize: 13, color: Colors.grey[400]),
+                ),
+              ],
+            ),
+            actions: [
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                  child: const Text(
+                    'Done',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
+            ],
           ),
         );
+
+        // Clear selection after successful recording
+        setState(() => _selectedEmployee = null);
       }
     } catch (e) {
       if (mounted) {
@@ -354,6 +428,29 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
     );
   }
 
+  Color _getAvatarColor(int id) {
+    final colors = [
+      const Color(0xFF1E88E5),
+      const Color(0xFF43A047),
+      const Color(0xFF8E24AA),
+      const Color(0xFFE53935),
+      const Color(0xFFFB8C00),
+      const Color(0xFF00ACC1),
+      const Color(0xFF3949AB),
+      const Color(0xFF7CB342),
+    ];
+    return colors[id % colors.length];
+  }
+
+  String _getInitials(Map<String, dynamic> emp) {
+    final first = (emp['first_name'] ?? '').toString();
+    final last = (emp['last_name'] ?? '').toString();
+    String initials = '';
+    if (first.isNotEmpty) initials += first[0].toUpperCase();
+    if (last.isNotEmpty) initials += last[0].toUpperCase();
+    return initials.isEmpty ? '?' : initials;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -437,7 +534,11 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                     ),
                     const SizedBox(height: 20),
 
-                    // 4. Calendar
+                    // 4. Employee Selector Card
+                    _buildEmployeeSelectorCard(),
+                    const SizedBox(height: 20),
+
+                    // 5. Calendar
                     Card(
                       elevation: 4,
                       shape: RoundedRectangleBorder(
@@ -483,7 +584,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
               ),
             ),
 
-            // 5. Action Buttons (Sticky at bottom)
+            // 6. Action Buttons (Sticky at bottom)
             Container(
               padding: const EdgeInsets.all(16.0),
               decoration: BoxDecoration(
@@ -501,7 +602,9 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                   Expanded(
                     child: _buildActionButton(
                       label: "TIME IN",
-                      color: Colors.green,
+                      color: _selectedEmployee != null
+                          ? Colors.green
+                          : Colors.grey,
                       icon: Icons.login,
                       onPressed: _isProcessing
                           ? null
@@ -512,7 +615,9 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                   Expanded(
                     child: _buildActionButton(
                       label: "TIME OUT",
-                      color: Colors.orange,
+                      color: _selectedEmployee != null
+                          ? Colors.orange
+                          : Colors.grey,
                       icon: Icons.logout,
                       onPressed: _isProcessing
                           ? null
@@ -520,6 +625,227 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                     ),
                   ),
                 ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmployeeSelectorCard() {
+    if (_isLoadingEmployees) {
+      return Card(
+        elevation: 3,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: const Padding(
+          padding: EdgeInsets.all(24),
+          child: Center(
+            child: Column(
+              children: [
+                SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                SizedBox(height: 12),
+                Text(
+                  'Loading employees...',
+                  style: TextStyle(color: Colors.grey),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (_selectedEmployee != null) {
+      return _buildSelectedEmployeeCard();
+    }
+
+    // No employee selected — show selector prompt
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: InkWell(
+        onTap: _openEmployeeSelector,
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade50,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.person_search_rounded,
+                  size: 28,
+                  color: Colors.blue.shade700,
+                ),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Who are you?',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF1A1A2E),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Tap to select your name',
+                      style: TextStyle(fontSize: 14, color: Colors.grey[500]),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                Icons.arrow_forward_ios_rounded,
+                size: 20,
+                color: Colors.grey[400],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSelectedEmployeeCard() {
+    final emp = _selectedEmployee!;
+    final photoUrl = emp['photo_url'] as String?;
+    final empId = emp['id'] as int;
+
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          gradient: LinearGradient(
+            colors: [_getAvatarColor(empId).withOpacity(0.05), Colors.white],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+        ),
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            // Avatar
+            Hero(
+              tag: 'employee_avatar_$empId',
+              child: Container(
+                width: 60,
+                height: 60,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _getAvatarColor(empId),
+                  boxShadow: [
+                    BoxShadow(
+                      color: _getAvatarColor(empId).withOpacity(0.3),
+                      blurRadius: 10,
+                      offset: const Offset(0, 3),
+                    ),
+                  ],
+                ),
+                child: photoUrl != null
+                    ? ClipOval(
+                        child: Image.network(
+                          photoUrl,
+                          fit: BoxFit.cover,
+                          width: 60,
+                          height: 60,
+                          errorBuilder: (_, __, ___) => Center(
+                            child: Text(
+                              _getInitials(emp),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                      )
+                    : Center(
+                        child: Text(
+                          _getInitials(emp),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+              ),
+            ),
+            const SizedBox(width: 14),
+
+            // Info
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${emp['first_name']} ${emp['last_name']}',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF1A1A2E),
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    emp['position'] ?? '',
+                    style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.verified_rounded,
+                        size: 14,
+                        color: Colors.green.shade600,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Ready to verify',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.green.shade600,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            // Change button
+            TextButton.icon(
+              onPressed: _openEmployeeSelector,
+              icon: const Icon(Icons.swap_horiz_rounded, size: 18),
+              label: const Text('Change'),
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.blue.shade700,
+                backgroundColor: Colors.blue.shade50,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
               ),
             ),
           ],
