@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/settings_service.dart';
+import '../services/update_service.dart';
 import '../config/app_config.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -12,12 +13,18 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   final _ssidController = TextEditingController();
   final _settingsService = SettingsService();
+  final _updateService = UpdateService.instance;
   bool _isLoading = true;
+
+  // Update state
+  int? _patchNumber;
+  bool _isCheckingUpdate = false;
 
   @override
   void initState() {
     super.initState();
     _loadSettings();
+    _loadPatchInfo();
   }
 
   Future<void> _loadSettings() async {
@@ -27,6 +34,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _ssidController.text = ssid;
         _isLoading = false;
       });
+    }
+  }
+
+  Future<void> _loadPatchInfo() async {
+    final patchNumber = await _updateService.getCurrentPatchNumber();
+    if (mounted) {
+      setState(() => _patchNumber = patchNumber);
     }
   }
 
@@ -49,6 +63,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _checkForUpdates() async {
+    setState(() => _isCheckingUpdate = true);
+
+    final updated = await _updateService.checkAndUpdate();
+
+    if (mounted) {
+      setState(() => _isCheckingUpdate = false);
+      await _loadPatchInfo();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            updated
+                ? 'Update downloaded! Restart the app to apply.'
+                : 'You are up to date.',
+          ),
+          backgroundColor: updated ? Colors.green : Colors.blue,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
   @override
   void dispose() {
     _ssidController.dispose();
@@ -61,11 +98,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       appBar: AppBar(title: const Text("Settings")),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
-          : Padding(
+          : SingleChildScrollView(
               padding: const EdgeInsets.all(16.0),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // ── Network Configuration ──
                   const Text(
                     "Network Configuration",
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -100,6 +138,97 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                       ),
                     ],
+                  ),
+
+                  const SizedBox(height: 32),
+                  const Divider(),
+                  const SizedBox(height: 16),
+
+                  // ── App Updates (Shorebird) ──
+                  const Text(
+                    "App Updates",
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 16),
+                  Card(
+                    elevation: 1,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(
+                                Icons.system_update_alt,
+                                color: Colors.blue.shade700,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text(
+                                      "Over-the-Air Updates",
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 15,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      _updateService.isAvailable
+                                          ? _patchNumber != null
+                                                ? "Patch #$_patchNumber installed"
+                                                : "No patches installed"
+                                          : "Not available (debug build)",
+                                      style: TextStyle(
+                                        color: Colors.grey[600],
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              onPressed:
+                                  _updateService.isAvailable &&
+                                      !_isCheckingUpdate
+                                  ? _checkForUpdates
+                                  : null,
+                              icon: _isCheckingUpdate
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white,
+                                      ),
+                                    )
+                                  : const Icon(Icons.refresh),
+                              label: Text(
+                                _isCheckingUpdate
+                                    ? "Checking..."
+                                    : "Check for Updates",
+                              ),
+                              style: ElevatedButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 12,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ],
               ),
