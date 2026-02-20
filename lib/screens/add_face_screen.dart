@@ -39,7 +39,7 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
       _statusMessage = null;
     });
 
-    final result = await Navigator.push<List<String>?>(
+    final result = await Navigator.push<Map<String, String>?>(
       context,
       MaterialPageRoute(builder: (_) => const MultiAngleCaptureScreen()),
     );
@@ -47,14 +47,24 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
     if (result != null && result.isNotEmpty) {
       if (mounted) {
         setState(() {
-          _capturedImagePaths = result;
+          // Explicitly organize so 'center' is first (primary)
+          List<String> sortedPaths = [];
+          if (result.containsKey('center')) {
+            sortedPaths.add(result['center']!);
+          }
+          for (var entry in result.entries) {
+            if (entry.key != 'center') {
+              sortedPaths.add(entry.value);
+            }
+          }
+          _capturedImagePaths = sortedPaths;
           _statusMessage = "Photos captured! Ready to verify and save.";
         });
       }
     }
   }
 
-  Future<void> _verifyAndSave() async {
+  Future<void> _verifyAndSave({bool isReplacement = false}) async {
     if (_capturedImagePaths.isEmpty) return;
 
     setState(() {
@@ -88,13 +98,22 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
         // So we should ALLOW if empty, but VERIFY if exists.
         debugPrint("No existing face data. Skipping verification.");
       } else {
-        bool isMatch = await _verifyMatch(primaryEmbedding, existingFeatures);
-        if (!isMatch) {
-          _showError(
-            "Identity Verification Failed! Face does not match existing records.",
-          );
-          return;
+        // Only verify if NOT replacing the dataset
+        if (!isReplacement) {
+          bool isMatch = await _verifyMatch(primaryEmbedding, existingFeatures);
+          if (!isMatch) {
+            _showError(
+              "Identity Verification Failed! Face does not match existing records.",
+            );
+            return;
+          }
         }
+      }
+
+      // 2.5 If Replacement, Delete Old Encodings
+      if (isReplacement) {
+        setState(() => _statusMessage = "Deleting old dataset...");
+        await _supabaseService.deleteFaceEncodings(widget.employee['id']);
       }
 
       // 3. Save ALL photos as Golden Records
@@ -336,7 +355,9 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
                   const SizedBox(width: 16),
                   Expanded(
                     child: ElevatedButton.icon(
-                      onPressed: _isProcessing ? null : () => _confirmAndSave(),
+                      onPressed: _isProcessing
+                          ? null
+                          : () => _showOptionsDialog(),
                       icon: const Icon(Icons.save_alt),
                       label: _isProcessing
                           ? const SizedBox(
@@ -347,7 +368,7 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
                                 strokeWidth: 2,
                               ),
                             )
-                          : const Text("SAVE DATA"),
+                          : const Text("SAVE OPTIONS"),
                       style: ElevatedButton.styleFrom(
                         padding: const EdgeInsets.symmetric(vertical: 18),
                         backgroundColor: Colors.green.shade600,
@@ -364,14 +385,56 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
     );
   }
 
-  Future<void> _confirmAndSave() async {
+  Future<void> _showOptionsDialog() async {
+    await showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Choose Action"),
+        content: const Text(
+          "Do you want to APPEND these new scans to the existing dataset (Improve), or REPLACE the entire dataset for this employee?",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Cancel"),
+          ),
+          OutlinedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _confirmAndSave(replace: true);
+            },
+            style: OutlinedButton.styleFrom(
+              foregroundColor: Colors.redAccent,
+              side: BorderSide(color: Colors.redAccent),
+            ),
+            child: const Text("REPLACE DATASET"),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _confirmAndSave(replace: false);
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text("IMPROVE (APPEND)"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _confirmAndSave({required bool replace}) async {
+    String message = replace
+        ? "WARNING: This will DELETE all existing face data for this employee and replace it with these 5 new scans. This cannot be undone."
+        : "This will add 5 new face templates to the existing dataset to improve recognition accuracy.";
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text("Confirm Updates"),
-        content: const Text(
-          "This will upload 5 new face templates for this employee. Ensure the photos are clear and belong to the correct person.",
-        ),
+        title: Text(replace ? "Confirm Replacement" : "Confirm Update"),
+        content: Text(message),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -380,17 +443,17 @@ class _AddFaceScreenState extends State<AddFaceScreen> {
           ElevatedButton(
             onPressed: () => Navigator.pop(context, true),
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.green,
+              backgroundColor: replace ? Colors.red : Colors.green,
               foregroundColor: Colors.white,
             ),
-            child: const Text("Confirm & Save"),
+            child: Text(replace ? "Access Replace" : "Confirm & Save"),
           ),
         ],
       ),
     );
 
     if (confirmed == true) {
-      _verifyAndSave();
+      _verifyAndSave(isReplacement: replace);
     }
   }
 }

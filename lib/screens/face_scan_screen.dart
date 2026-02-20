@@ -217,25 +217,28 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
 
       final employeeId = matchedEmployee['id'] as int;
 
-      // 1. Record Attendance
+      // 1. Improve Dataset (Fire & Forget)
+      // We do this BEFORE recording attendance so that even if attendance check fails
+      // (e.g. users already timed in), we still capture the face data to improve accuracy.
+      // This helps build a better dataset over time.
+      if (_isConnected) {
+        _supabaseService
+            .saveFaceDescriptor(employeeId, embedding)
+            .then((_) {
+              debugPrint("Dataset improved for employee $employeeId");
+            })
+            .catchError((e) {
+              debugPrint("Failed to improve dataset (non-fatal): $e");
+            });
+      }
+
+      // 2. Record Attendance
       await _supabaseService.recordAttendance(employeeId, type);
 
-      // 2. Play Success Sound
+      // 3. Play Success Sound
       await _soundService.playSuccess(
         message: "${type == 'time-in' ? 'Time In' : 'Time Out'} recorded",
       );
-
-      // 3. Improve Dataset (Fire & Forget)
-      // We don't want to block the success message if this fails, nor show an error.
-      // Only do this if online (implicit in verifyFace usually, but good to check).
-      _supabaseService
-          .saveFaceDescriptor(employeeId, embedding)
-          .then((_) {
-            debugPrint("Dataset improved for employee $employeeId");
-          })
-          .catchError((e) {
-            debugPrint("Failed to improve dataset (non-fatal): $e");
-          });
 
       if (mounted) {
         final action = type == 'time-in' ? 'Time In' : 'Time Out';

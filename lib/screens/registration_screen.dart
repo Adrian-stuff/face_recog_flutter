@@ -43,7 +43,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   }
 
   Future<void> _startMultiAngleCapture() async {
-    final result = await Navigator.push<List<String>?>(
+    final result = await Navigator.push<Map<String, String>?>(
       context,
       MaterialPageRoute(builder: (_) => const MultiAngleCaptureScreen()),
     );
@@ -51,7 +51,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     if (result != null && result.isNotEmpty) {
       if (mounted) {
         setState(() {
-          _capturedImagePaths = result;
+          _capturedImagePaths = result.values.toList();
         });
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(

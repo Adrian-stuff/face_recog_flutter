@@ -149,6 +149,34 @@ class SupabaseService {
     }
   }
 
+  Future<void> deleteFaceEncodings(int employeeId) async {
+    if (!await isOnline) {
+      throw Exception("Cannot delete dataset while offline");
+    }
+
+    try {
+      final url = Uri.parse(
+        '${AppConfig.nextJsBaseUrl}/api/face-encoding?employeeId=$employeeId',
+      );
+      final response = await http.delete(
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': AppConfig.mobileApiKey,
+        },
+      );
+
+      if (response.statusCode != 200) {
+        throw Exception(
+          'Failed to delete encodings: ${response.statusCode} ${response.body}',
+        );
+      }
+    } catch (e) {
+      debugPrint('Error deleting face encodings: $e');
+      rethrow;
+    }
+  }
+
   Future<Map<String, dynamic>?> verifyFace(List<double> embedding) async {
     if (await isOnline) {
       // ONLINE: Use pgvector RPC

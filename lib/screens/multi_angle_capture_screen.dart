@@ -284,7 +284,9 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
 
   void _finish() {
     _timeoutTimer?.cancel();
-    Navigator.pop(context, _capturedImages.values.toList());
+    // Return a Map<String, String> where keys are step names (center, left, etc.)
+    final result = _capturedImages.map((k, v) => MapEntry(k.name, v));
+    Navigator.pop(context, result);
   }
 
   void _onTimeout() {
