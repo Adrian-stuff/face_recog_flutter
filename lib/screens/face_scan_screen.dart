@@ -71,8 +71,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
     }
 
     // Trigger background sync
-    _supabaseService.syncEmployees();
-    _supabaseService.syncLogs();
+    _supabaseService.startBackgroundSync();
 
     // Load employees for selector
     _loadEmployees();

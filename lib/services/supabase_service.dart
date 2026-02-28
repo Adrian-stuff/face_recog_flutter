@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:convert';
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
@@ -17,6 +18,7 @@ class SupabaseService {
 
   final SupabaseClient _client = Supabase.instance.client;
   final LocalDatabaseService _localDb = LocalDatabaseService();
+  Timer? _syncTimer;
 
   /// Check internet connectivity
   Future<bool> get isOnline async {
@@ -112,6 +114,86 @@ class SupabaseService {
     }
   }
 
+  /// Starts a periodic background sync for employees and logs.
+  /// Default interval is 5 minutes. Safe to call multiple times (previous timer will be cancelled).
+  void startBackgroundSync({int intervalMinutes = 5}) {
+    try {
+      _syncTimer?.cancel();
+
+      // Attempt to ping server and run an initial sync (handles cold start)
+      _attemptPingAndSync();
+
+      // Periodic background sync: verify server reachable before syncing
+      _syncTimer = Timer.periodic(Duration(minutes: intervalMinutes), (
+        _,
+      ) async {
+        try {
+          if (await pingServer()) {
+            await syncEmployees();
+            await syncLogs();
+          } else {
+            debugPrint('Background sync skipped: server unreachable');
+          }
+        } catch (e) {
+          debugPrint('Background sync tick failed: $e');
+        }
+      });
+    } catch (e) {
+      debugPrint('Failed to start background sync: $e');
+    }
+  }
+
+  /// Ping the Next.js backend to wake it up or check status.
+  /// Returns true if the server responds with HTTP 200 within timeout.
+  Future<bool> pingServer({
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    try {
+      final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/ping');
+      final response = await http
+          .get(
+            url,
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': AppConfig.mobileApiKey,
+            },
+          )
+          .timeout(timeout);
+
+      if (response.statusCode == 200) return true;
+      debugPrint('Ping server returned ${response.statusCode}');
+      return false;
+    } catch (e) {
+      debugPrint('Ping server failed: $e');
+      return false;
+    }
+  }
+
+  void _attemptPingAndSync([int attemptsRemaining = 3]) async {
+    try {
+      final ok = await pingServer();
+      if (ok) {
+        // Server is up — perform initial syncs
+        syncEmployees();
+        syncLogs();
+      } else {
+        if (attemptsRemaining > 0) {
+          debugPrint(
+            'Ping failed — retrying in 10s (${attemptsRemaining - 1} left)',
+          );
+          Timer(
+            Duration(seconds: 10),
+            () => _attemptPingAndSync(attemptsRemaining - 1),
+          );
+        } else {
+          debugPrint('Ping failed after retries — will rely on periodic sync');
+        }
+      }
+    } catch (e) {
+      debugPrint('Attempt ping and sync failed: $e');
+    }
+  }
+
   // --- Core Features ---
 
   Future<void> saveFaceDescriptor(
@@ -178,38 +260,8 @@ class SupabaseService {
   }
 
   Future<Map<String, dynamic>?> verifyFace(List<double> embedding) async {
-    if (await isOnline) {
-      // ONLINE: Use pgvector RPC
-      try {
-        final vectorStr = '[${embedding.join(',')}]';
-        final response = await _client.rpc(
-          'match_face',
-          params: {
-            'query_embedding': vectorStr,
-            'match_threshold': 0.7,
-            'match_count': 1,
-          },
-        );
-
-        final List<dynamic> results = response;
-        if (results.isEmpty) return null;
-
-        final match = results.first as Map<String, dynamic>;
-        return {
-          'id': match['employee_id'],
-          'first_name': match['first_name'],
-          'last_name': match['last_name'],
-          'position': match['position'],
-          'similarity': match['similarity'],
-        };
-      } catch (e) {
-        debugPrint('Online verification failed: $e');
-        // Fallback to offline if RPC fails
-      }
-    }
-
-    // OFFLINE: Local Cosine Similarity
-    debugPrint('Using Offline Verification...');
+    // Prefer LOCAL verification first to avoid network calls on each scan.
+    debugPrint('Attempting Local Verification first...');
     final employees = await _localDb.getAllEmployees();
     double maxScore = -1.0;
     Map<String, dynamic>? bestMatch;
@@ -221,24 +273,17 @@ class SupabaseService {
       List<List<double>> candidateVectors = [];
 
       try {
-        // Try parsing as List<List<double>> (New Format)
         final decoded = jsonDecode(featureStr);
         if (decoded is List) {
           if (decoded.isNotEmpty && decoded.first is List) {
-            // It's [[...], [...]]
             candidateVectors = (decoded as List)
                 .map((e) => List<double>.from(e))
                 .toList();
           } else {
-            // Fallback: It might be a single list [0.1, ...] (Old Format or single vector)
-            // But wait, our sync logic now enforces List<List>.
-            // However, let's be safe. If it's a simple list of numbers, wrap it.
             candidateVectors = [List<double>.from(decoded)];
           }
         }
       } catch (e) {
-        // Fallback: maybe it's the old raw string format "[0.1, ...]"
-        // Try parsing manually
         try {
           final vectorList = featureStr
               .replaceAll('[', '')
@@ -252,11 +297,9 @@ class SupabaseService {
         }
       }
 
-      // Check ALL candidate vectors for this employee
       for (final vectorList in candidateVectors) {
         if (vectorList.length != embedding.length) continue;
 
-        // Calculate Cosine Similarity
         double dotProduct = 0.0;
         double normA = 0.0;
         double normB = 0.0;
@@ -284,6 +327,39 @@ class SupabaseService {
         'position': bestMatch['position'],
         'similarity': maxScore,
       };
+    }
+
+    // Local didn't find a match. If online, fall back to server RPC (and trigger background sync if successful).
+    if (await isOnline) {
+      try {
+        final vectorStr = '[${embedding.join(',')}]';
+        final response = await _client.rpc(
+          'match_face',
+          params: {
+            'query_embedding': vectorStr,
+            'match_threshold': 0.7,
+            'match_count': 1,
+          },
+        );
+
+        final List<dynamic> results = response;
+        if (results.isEmpty) return null;
+
+        final match = results.first as Map<String, dynamic>;
+
+        // Trigger a background sync so local cache is updated for future offline/fast lookups.
+        syncEmployees();
+
+        return {
+          'id': match['employee_id'],
+          'first_name': match['first_name'],
+          'last_name': match['last_name'],
+          'position': match['position'],
+          'similarity': match['similarity'],
+        };
+      } catch (e) {
+        debugPrint('Online verification failed: $e');
+      }
     }
 
     return null;
@@ -579,25 +655,93 @@ class SupabaseService {
     List<double> embedding,
     int employeeId,
   ) async {
+    // Prefer OFFLINE verification for speed and to avoid repeated DB calls.
+    debugPrint(
+      'Using Offline Targeted Verification for employee $employeeId...',
+    );
+    final emp = await _localDb.getEmployee(employeeId);
+    if (emp != null) {
+      final featureStr = emp['face_features'] as String?;
+      if (featureStr != null) {
+        List<List<double>> candidateVectors = [];
+
+        try {
+          final decoded = jsonDecode(featureStr);
+          if (decoded is List) {
+            if (decoded.isNotEmpty && decoded.first is List) {
+              candidateVectors = (decoded as List)
+                  .map((e) => List<double>.from(e))
+                  .toList();
+            } else {
+              candidateVectors = [List<double>.from(decoded)];
+            }
+          }
+        } catch (e) {
+          try {
+            final vectorList = featureStr
+                .replaceAll('[', '')
+                .replaceAll(']', '')
+                .split(',')
+                .map((e) => double.tryParse(e.trim()) ?? 0.0)
+                .toList();
+            candidateVectors = [vectorList];
+          } catch (_) {
+            // fall through to RPC fallback below
+            candidateVectors = [];
+          }
+        }
+
+        double maxScore = -1.0;
+
+        for (final vectorList in candidateVectors) {
+          if (vectorList.length != embedding.length) continue;
+
+          double dotProduct = 0.0;
+          double normA = 0.0;
+          double normB = 0.0;
+
+          for (int i = 0; i < embedding.length; i++) {
+            dotProduct += embedding[i] * vectorList[i];
+            normA += embedding[i] * embedding[i];
+            normB += vectorList[i] * vectorList[i];
+          }
+
+          final score = dotProduct / (sqrt(normA) * sqrt(normB));
+          if (score > maxScore) {
+            maxScore = score;
+          }
+        }
+
+        if (maxScore >= 0.6) {
+          return {
+            'id': emp['id'],
+            'first_name': emp['first_name'],
+            'last_name': emp['last_name'],
+            'position': emp['position'],
+            'similarity': maxScore,
+          };
+        }
+      }
+    }
+
+    // Local verification didn't confirm. If online, fall back to RPC and trigger background sync if match found.
     if (await isOnline) {
-      // ONLINE: Use pgvector RPC to match against a specific employee
       try {
         final vectorStr = '[${embedding.join(',')}]';
         final response = await _client.rpc(
           'match_face',
           params: {
             'query_embedding': vectorStr,
-            'match_threshold':
-                0.6, // Lower threshold since we know who to expect
-            'match_count':
-                5, // Get top matches to check if our employee is among them
+            'match_threshold': 0.6,
+            'match_count': 5,
           },
         );
 
         final List<dynamic> results = response;
-        // Find the match for our specific employee
         for (final match in results) {
           if (match['employee_id'] == employeeId) {
+            // Refresh local cache in background
+            syncEmployees();
             return {
               'id': match['employee_id'],
               'first_name': match['first_name'],
@@ -607,82 +751,9 @@ class SupabaseService {
             };
           }
         }
-
-        // Employee not in results — face doesn't match
-        return null;
       } catch (e) {
         debugPrint('Online targeted verification failed: $e');
-        // Fallback to offline
       }
-    }
-
-    // OFFLINE: Local Cosine Similarity against the specific employee
-    debugPrint(
-      'Using Offline Targeted Verification for employee $employeeId...',
-    );
-    final emp = await _localDb.getEmployee(employeeId);
-    if (emp == null) return null;
-
-    final featureStr = emp['face_features'] as String?;
-    if (featureStr == null) return null;
-
-    List<List<double>> candidateVectors = [];
-
-    try {
-      final decoded = jsonDecode(featureStr);
-      if (decoded is List) {
-        if (decoded.isNotEmpty && decoded.first is List) {
-          candidateVectors = (decoded as List)
-              .map((e) => List<double>.from(e))
-              .toList();
-        } else {
-          candidateVectors = [List<double>.from(decoded)];
-        }
-      }
-    } catch (e) {
-      try {
-        final vectorList = featureStr
-            .replaceAll('[', '')
-            .replaceAll(']', '')
-            .split(',')
-            .map((e) => double.tryParse(e.trim()) ?? 0.0)
-            .toList();
-        candidateVectors = [vectorList];
-      } catch (_) {
-        return null;
-      }
-    }
-
-    double maxScore = -1.0;
-
-    // Check ALL candidate vectors for this employee
-    for (final vectorList in candidateVectors) {
-      if (vectorList.length != embedding.length) continue;
-
-      double dotProduct = 0.0;
-      double normA = 0.0;
-      double normB = 0.0;
-
-      for (int i = 0; i < embedding.length; i++) {
-        dotProduct += embedding[i] * vectorList[i];
-        normA += embedding[i] * embedding[i];
-        normB += vectorList[i] * vectorList[i];
-      }
-
-      final score = dotProduct / (sqrt(normA) * sqrt(normB));
-      if (score > maxScore) {
-        maxScore = score;
-      }
-    }
-
-    if (maxScore >= 0.6) {
-      return {
-        'id': emp['id'],
-        'first_name': emp['first_name'],
-        'last_name': emp['last_name'],
-        'position': emp['position'],
-        'similarity': maxScore,
-      };
     }
 
     return null;
