@@ -99,6 +99,7 @@ class SupabaseService {
             'employeeId': log['employee_id'],
             'type': log['type'],
             'time': timeStr,
+            'timestamp': timestamp,
           }),
         );
 
@@ -425,6 +426,7 @@ class SupabaseService {
             'employeeId': employeeId,
             'type': type,
             'time': timeStr,
+            'timestamp': now.toIso8601String(),
           }),
         );
 
