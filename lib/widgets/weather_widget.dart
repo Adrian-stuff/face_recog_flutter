@@ -2,7 +2,6 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
-import 'package:intl/intl.dart';
 
 class WeatherWidget extends StatefulWidget {
   const WeatherWidget({super.key});
@@ -14,7 +13,6 @@ class WeatherWidget extends StatefulWidget {
 class _WeatherWidgetState extends State<WeatherWidget> {
   String _temperature = '--';
   String _condition = 'Loading...';
-  String _city = 'Locating...';
   IconData _icon = Icons.cloud_queue;
   bool _loading = true;
 
@@ -32,7 +30,6 @@ class _WeatherWidgetState extends State<WeatherWidget> {
 
       serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
-        if (mounted) setState(() => _city = 'Location disabled');
         return;
       }
 
@@ -40,13 +37,11 @@ class _WeatherWidgetState extends State<WeatherWidget> {
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
         if (permission == LocationPermission.denied) {
-          if (mounted) setState(() => _city = 'Permission denied');
           return;
         }
       }
 
       if (permission == LocationPermission.deniedForever) {
-        if (mounted) setState(() => _city = 'Permission denied');
         return;
       }
 
@@ -70,7 +65,6 @@ class _WeatherWidgetState extends State<WeatherWidget> {
             _temperature = '${temp.round()}°C';
             _condition = _getConditionText(conditionCode);
             _icon = _getConditionIcon(conditionCode);
-            _city = 'Current Location'; // Simple placeholder
             _loading = false;
           });
         }

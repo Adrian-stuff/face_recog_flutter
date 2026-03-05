@@ -7,4 +7,9 @@ class AppConfig {
 
   // API Key for Secure Communication
   static const String mobileApiKey = 'sb_attendance_sec_9921_x3y7z9';
+
+  /// Employee avatar endpoint - constructs URL for getting employee avatar by ID
+  static String getEmployeeAvatarUrl(int employeeId) {
+    return '$nextJsBaseUrl/api/dashboard/employees/avatar?id=$employeeId';
+  }
 }

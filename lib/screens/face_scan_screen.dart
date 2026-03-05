@@ -60,11 +60,37 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
     // Request permissions upfront
     await [Permission.camera, Permission.location].request();
 
-    // Pre-warm FaceService (loads TFLite model)
+    // Initialize FaceService (fast - returns after starting model load in background)
     try {
       await _faceService.initialize();
       await _soundService.initialize();
-      if (mounted) setState(() => _statusMessage = "Ready");
+
+      // Set status based on model loading state
+      if (mounted) {
+        if (_faceService.isModelLoading) {
+          setState(() => _statusMessage = "Loading face recognition model...");
+
+          // Wait for model in background while showing status
+          _faceService
+              .waitForModelReady(timeout: const Duration(seconds: 45))
+              .then((_) {
+                if (mounted) {
+                  setState(() => _statusMessage = "Ready");
+                }
+              })
+              .catchError((e) {
+                if (mounted) {
+                  setState(
+                    () =>
+                        _statusMessage = "Model loading timeout. Offline mode.",
+                  );
+                  debugPrint('Model load timeout: $e');
+                }
+              });
+        } else {
+          setState(() => _statusMessage = "Ready");
+        }
+      }
     } catch (e) {
       debugPrint("FaceService init error: $e");
       if (mounted) setState(() => _statusMessage = "Service Error");

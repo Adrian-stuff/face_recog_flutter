@@ -151,54 +151,151 @@ class FaceService {
   Interpreter? _interpreter;
   Uint8List? _modelBytes;
   bool _isInitialized = false;
+  bool _isLoadingModel = false;
   String? _interpreterError;
-  Completer<void>? _initCompleter;
+  Completer<void>? _faceDetectorCompleter;
+  Completer<void>? _modelLoadCompleter;
+
+  // Model loading configuration
+  static const _MODEL_LOAD_TIMEOUT = Duration(seconds: 30);
+  static const _MODEL_LOAD_MAX_RETRIES = 2;
 
   bool get isInterpreterReady => _interpreter != null;
+  bool get isModelLoading => _isLoadingModel;
   String? get interpreterErrorMessage => _interpreterError;
 
   Future<void> initialize() async {
     if (_isInitialized) return;
 
-    if (_initCompleter != null) {
-      await _initCompleter!.future;
-      return;
-    }
-
-    _initCompleter = Completer<void>();
-
     try {
+      // Initialize Face Detector immediately (fast, non-blocking)
       _faceDetector ??= FaceDetector(
         options: FaceDetectorOptions(
-          enableContours: true,
-          enableClassification: true,
-          enableLandmarks: true,
-          performanceMode: FaceDetectorMode.accurate,
+          enableContours: false, // ✅ Disabled (unnecessary, slow)
+          enableClassification: true, // Needed for eye open probability
+          enableLandmarks: false, // ✅ Disabled (unnecessary, slow)
+          performanceMode: FaceDetectorMode.fast, // ✅ Optimized for speed
         ),
       );
 
-      try {
-        // Pre-load model bytes so they can be passed to isolates later.
-        // rootBundle.load only works on the main thread.
-        final rawAsset = await rootBundle.load('assets/mobilefacenet.tflite');
-        _modelBytes = rawAsset.buffer.asUint8List();
-
-        final options = InterpreterOptions();
-        _interpreter = Interpreter.fromBuffer(_modelBytes!, options: options);
-        _interpreterError = null;
-        debugPrint('Face Recognition Model Loaded');
-      } catch (e) {
-        _interpreterError = e.toString();
-        debugPrint('Failed to load Face Recognition Model: $e');
-      }
-
       _isInitialized = true;
-      _initCompleter!.complete();
+      debugPrint('FaceDetector initialized (fast mode)');
+
+      // Start background model loading (non-blocking)
+      // Don't await - let it happen in background
+      _loadModelInBackground();
     } catch (e) {
-      _initCompleter!.completeError(e);
-      _initCompleter = null;
+      debugPrint("FaceDetector init error: $e");
+      _interpreterError = "FaceDetector initialization failed: $e";
       rethrow;
     }
+  }
+
+  /// Load TFLite model in background with retry logic and timeout
+  void _loadModelInBackground() {
+    if (_isLoadingModel) return;
+
+    _isLoadingModel = true;
+    _modelLoadCompleter = Completer<void>();
+
+    // Run on isolate to avoid blocking UI thread
+    Future(() async {
+      int retryCount = 0;
+
+      while (retryCount <= _MODEL_LOAD_MAX_RETRIES) {
+        try {
+          await _loadModel().timeout(
+            _MODEL_LOAD_TIMEOUT,
+            onTimeout: () => throw TimeoutException(
+              'Model load exceeded $_MODEL_LOAD_TIMEOUT',
+            ),
+          );
+
+          // Success - complete early
+          if (!_modelLoadCompleter!.isCompleted) {
+            _modelLoadCompleter!.complete();
+          }
+          _isLoadingModel = false;
+          return;
+        } catch (e) {
+          retryCount++;
+
+          if (retryCount <= _MODEL_LOAD_MAX_RETRIES) {
+            debugPrint(
+              'Model load failed (attempt $retryCount), retrying in 1 second...: $e',
+            );
+            await Future.delayed(const Duration(seconds: 1));
+          } else {
+            debugPrint(
+              'Model load failed after $_MODEL_LOAD_MAX_RETRIES retries: $e',
+            );
+            _interpreterError = e.toString();
+
+            if (!_modelLoadCompleter!.isCompleted) {
+              _modelLoadCompleter!.completeError(e);
+            }
+            _isLoadingModel = false;
+
+            // Dispatch error notification
+            _notifyModelLoadFailure(e.toString());
+            return;
+          }
+        }
+      }
+    });
+  }
+
+  /// Load the TFLite model from assets
+  Future<void> _loadModel() async {
+    try {
+      // Load model bytes (only works on main thread)
+      final rawAsset = await rootBundle.load('assets/mobilefacenet.tflite');
+      _modelBytes = rawAsset.buffer.asUint8List();
+
+      debugPrint('Model bytes loaded: ${_modelBytes!.length} bytes');
+
+      // Create interpreter with default options
+      final options = InterpreterOptions();
+      _interpreter = Interpreter.fromBuffer(_modelBytes!, options: options);
+
+      _interpreterError = null;
+      debugPrint('✅ Face Recognition Model fully loaded and ready');
+    } catch (e) {
+      debugPrint('❌ Failed to load Face Recognition Model: $e');
+      rethrow;
+    }
+  }
+
+  /// Wait for model to be ready (with optional timeout)
+  Future<void> waitForModelReady({Duration? timeout}) async {
+    timeout ??= const Duration(seconds: 30);
+
+    if (_interpreter != null) {
+      // Model already loaded
+      return;
+    }
+
+    if (!_isLoadingModel) {
+      throw Exception('Model loading not started. Call initialize() first.');
+    }
+
+    try {
+      await _modelLoadCompleter!.future.timeout(timeout);
+    } on TimeoutException {
+      throw TimeoutException(
+        'Model loading exceeded timeout of $timeout. The model may still be loading in background.',
+      );
+    }
+  }
+
+  /// Check if model is ready
+  bool isModelReady() => _interpreter != null;
+
+  /// Notify listeners about model load failure (can be extended with callbacks)
+  void _notifyModelLoadFailure(String error) {
+    debugPrint('⚠️ Model load failure notification: $error');
+    // TODO: Implement callback pattern here if needed for UI updates
+    // e.g., _modelLoadErrorCallback?.call(error);
   }
 
   void dispose() {
@@ -207,8 +304,20 @@ class FaceService {
 
     _interpreter?.close();
     _interpreter = null;
+
     _isInitialized = false;
-    _initCompleter = null;
+    _isLoadingModel = false;
+
+    if (_faceDetectorCompleter != null &&
+        !_faceDetectorCompleter!.isCompleted) {
+      _faceDetectorCompleter!.completeError('Service disposed');
+    }
+    _faceDetectorCompleter = null;
+
+    if (_modelLoadCompleter != null && !_modelLoadCompleter!.isCompleted) {
+      _modelLoadCompleter!.completeError('Service disposed');
+    }
+    _modelLoadCompleter = null;
   }
 
   Future<Map<String, dynamic>> processImage(
@@ -276,8 +385,18 @@ class FaceService {
     Face face,
     int rotation,
   ) async {
+    // Wait for model if still loading (with timeout)
+    if (_interpreter == null && _isLoadingModel) {
+      try {
+        await waitForModelReady(timeout: const Duration(seconds: 15));
+      } catch (e) {
+        debugPrint('Model not ready before timeout: $e');
+        return null;
+      }
+    }
+
     if (_interpreter == null) {
-      debugPrint('Interpreter not initialized');
+      debugPrint('Interpreter not available. Call initialize() first.');
       return null;
     }
 
@@ -292,7 +411,7 @@ class FaceService {
       final rootIsolateToken = RootIsolateToken.instance;
       if (rootIsolateToken == null) {
         debugPrint('Could not get RootIsolateToken');
-        return null; // Should fall back or handle error
+        return null;
       }
 
       final inferenceData = _InferenceData(

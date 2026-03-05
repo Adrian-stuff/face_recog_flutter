@@ -4,6 +4,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
 
 import 'dart:math';
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -50,10 +52,7 @@ class SupabaseService {
 
       final List<dynamic> employees = jsonDecode(response.body);
 
-      // Transform data for local storage
       final List<Map<String, dynamic>> localData = employees.map((e) {
-        // The API returns 'face_features' as a direct list of descriptors (arrays)
-        // e.g. [[0.1, ...], [0.2, ...]] or an empty array
         final features = e['face_features'];
 
         String? descriptorStr;
@@ -66,14 +65,144 @@ class SupabaseService {
           'first_name': e['first_name'],
           'last_name': e['last_name'],
           'position': e['position'],
+          'image_url': e['image_url'],
           'face_features': descriptorStr,
         };
       }).toList();
 
       await _localDb.syncEmployees(localData);
+
+      for (var emp in employees) {
+        final empId = emp['id'] as int;
+        final imageUrl = emp['image_url'] as String?;
+
+        // Try to cache both the original image_url and the avatar endpoint
+        if (imageUrl != null && imageUrl.isNotEmpty) {
+          await _downloadAndCacheEmployeeImage(empId, imageUrl);
+        }
+
+        // Also cache from the direct avatar endpoint as a fallback/primary source
+        final avatarUrl = AppConfig.getEmployeeAvatarUrl(empId);
+        await _downloadAndCacheEmployeeImage(empId, avatarUrl);
+      }
     } catch (e) {
       debugPrint('Sync Error: $e');
     }
+  }
+
+  /// Gets the avatar URL for an employee (with local caching fallback)
+  Future<String?> getEmployeeAvatarUrl(
+    int employeeId, {
+    bool preferLocal = true,
+  }) async {
+    if (preferLocal) {
+      // Check if local cached version exists
+      final localPath = await _getLocalImagePath(employeeId);
+      if (localPath != null && localPath.isNotEmpty) {
+        final file = File(localPath);
+        if (await file.exists()) {
+          return localPath;
+        }
+      }
+    }
+
+    // Return the avatar API endpoint URL (will be loaded with network image)
+    return AppConfig.getEmployeeAvatarUrl(employeeId);
+  }
+
+  /// Gets the local cached image path for an employee
+  Future<String?> _getLocalImagePath(int employeeId) async {
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final localPath = p.join(
+        appDir.path,
+        'employee_avatars',
+        '${employeeId}_avatar.jpg',
+      );
+      return localPath;
+    } catch (e) {
+      debugPrint('Error getting local image path: $e');
+      return null;
+    }
+  }
+
+  Future<String?> _downloadAndCacheEmployeeImage(
+    int employeeId,
+    String imageUrl,
+  ) async {
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final imagesDir = Directory(p.join(appDir.path, 'employee_avatars'));
+
+      if (!await imagesDir.exists()) {
+        try {
+          await imagesDir.create(recursive: true);
+        } catch (e) {
+          debugPrint('Failed to create avatars directory: $e');
+          return null;
+        }
+      }
+
+      final localPath = p.join(imagesDir.path, '${employeeId}_avatar.jpg');
+      final localFile = File(localPath);
+
+      // If file already exists and is recent, skip re-downloading
+      if (await localFile.exists()) {
+        try {
+          final stat = await localFile.stat();
+          final age = DateTime.now().difference(stat.modified);
+          // Only re-download if cached file is older than 24 hours
+          if (age.inHours < 24) {
+            await _localDb.updateEmployeeLocalImagePath(employeeId, localPath);
+            debugPrint('Using cached avatar for employee $employeeId');
+            return localPath;
+          }
+        } catch (e) {
+          debugPrint('Error checking cache age: $e');
+        }
+      }
+
+      // Download with proper timeout and error handling
+      try {
+        final response = await http
+            .get(
+              Uri.parse(imageUrl),
+              headers: {'x-api-key': AppConfig.mobileApiKey},
+            )
+            .timeout(
+              const Duration(seconds: 15),
+              onTimeout: () => http.Response('Download timeout', 408),
+            );
+
+        if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
+          // Write to temp file first, then move to avoid corruption
+          final tempPath = '$localPath.tmp';
+          final tempFile = File(tempPath);
+
+          await tempFile.writeAsBytes(response.bodyBytes);
+
+          // Atomic move
+          await tempFile.rename(localPath);
+
+          await _localDb.updateEmployeeLocalImagePath(employeeId, localPath);
+          debugPrint(
+            'Downloaded and cached avatar for employee $employeeId (${response.bodyBytes.length} bytes)',
+          );
+          return localPath;
+        } else {
+          debugPrint(
+            'Failed to download avatar for $employeeId: HTTP ${response.statusCode}',
+          );
+        }
+      } on TimeoutException {
+        debugPrint(
+          'Timeout downloading avatar for employee $employeeId from $imageUrl',
+        );
+      }
+    } catch (e) {
+      debugPrint('Error caching avatar for employee $employeeId: $e');
+    }
+    return null;
   }
 
   /// Syncs offline logs to Supabase (Up Sync)
@@ -103,14 +232,63 @@ class SupabaseService {
           }),
         );
 
-        if (response.statusCode == 200) {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
           // Mark as synced only if successful
           await _localDb.markLogsAsSynced([log['id'] as int]);
+        } else if (response.statusCode >= 400 && response.statusCode < 500) {
+          // Client error (e.g. 'Already timed in'). Retrying won't fix it.
+          // We mark it as synced to remove it from the pending sync queue.
+          debugPrint('Client error syncing log ${log['id']}: ${response.body}');
+          await _localDb.markLogsAsSynced([log['id'] as int]);
         } else {
-          debugPrint('Failed to sync log ${log['id']}: ${response.body}');
+          debugPrint(
+            'Failed to sync log ${log['id']} (Server error): ${response.body}',
+          );
         }
       } catch (e) {
         debugPrint('Failed to sync log ${log['id']}: $e');
+      }
+    }
+  }
+
+  /// Syncs offline face encodings to Supabase (Up Sync)
+  Future<void> syncEncodings() async {
+    if (!await isOnline) return;
+
+    final encodings = await _localDb.getUnsyncedEncodings();
+    if (encodings.isEmpty) return;
+
+    for (var enc in encodings) {
+      try {
+        final descriptorStr = enc['descriptor'] as String;
+        final descriptor = jsonDecode(descriptorStr) as List<dynamic>;
+
+        final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/face-encoding');
+        final response = await http.post(
+          url,
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': AppConfig.mobileApiKey,
+          },
+          body: jsonEncode({
+            'employeeId': enc['employee_id'],
+            'descriptor': descriptor,
+            'isGolden': enc['is_golden'] == 1,
+          }),
+        );
+
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          await _localDb.markEncodingsAsSynced([enc['id'] as int]);
+        } else if (response.statusCode >= 400 && response.statusCode < 500) {
+          debugPrint(
+            'Client error syncing encoding ${enc['id']}: ${response.body}',
+          );
+          await _localDb.markEncodingsAsSynced([enc['id'] as int]);
+        } else {
+          debugPrint('Failed to sync encoding ${enc['id']}: ${response.body}');
+        }
+      } catch (e) {
+        debugPrint('Failed to sync encoding ${enc['id']}: $e');
       }
     }
   }
@@ -132,6 +310,7 @@ class SupabaseService {
           if (await pingServer()) {
             await syncEmployees();
             await syncLogs();
+            await syncEncodings();
           } else {
             debugPrint('Background sync skipped: server unreachable');
           }
@@ -177,6 +356,7 @@ class SupabaseService {
         // Server is up — perform initial syncs
         syncEmployees();
         syncLogs();
+        syncEncodings();
       } else {
         if (attemptsRemaining > 0) {
           debugPrint(
@@ -203,7 +383,13 @@ class SupabaseService {
     bool isGolden = false,
   }) async {
     if (!await isOnline) {
-      throw Exception("Cannot update dataset while offline");
+      debugPrint('Offline: saving face descriptor locally');
+      await _localDb.insertOfflineEncoding(
+        employeeId,
+        embedding,
+        isGolden: isGolden,
+      );
+      return;
     }
 
     try {
@@ -228,7 +414,12 @@ class SupabaseService {
       }
     } catch (e) {
       debugPrint('Error saving face descriptor: $e');
-      rethrow;
+      // Fallback to offline storage on any error
+      await _localDb.insertOfflineEncoding(
+        employeeId,
+        embedding,
+        isGolden: isGolden,
+      );
     }
   }
 
@@ -260,58 +451,45 @@ class SupabaseService {
     }
   }
 
+  // --- Helper: Fast dot product for pre-normalized vectors ---
+
+  /// Fast dot product - for pre-normalized vectors, this IS the cosine similarity
+  static double _fastDotProduct(List<double> vec1, List<double> vec2) {
+    if (vec1.length != vec2.length) return -1.0;
+    double result = 0.0;
+    for (int i = 0; i < vec1.length; i++) {
+      result += vec1[i] * vec2[i];
+    }
+    return result;
+  }
+
   Future<Map<String, dynamic>?> verifyFace(List<double> embedding) async {
-    // Prefer LOCAL verification first to avoid network calls on each scan.
-    debugPrint('Attempting Local Verification first...');
+    // Normalize input embedding
+    double norm = 0;
+    for (var x in embedding) {
+      norm += x * x;
+    }
+    norm = sqrt(norm);
+    if (norm < 1e-10) return null;
+
+    final normalizedEmbedding = embedding.map((x) => x / norm).toList();
+
+    // Prefer LOCAL verification first using pre-normalized vectors (FAST)
+    debugPrint('Attempting Local Verification with cached vectors...');
     final employees = await _localDb.getAllEmployees();
     double maxScore = -1.0;
     Map<String, dynamic>? bestMatch;
 
     for (var emp in employees) {
-      final featureStr = emp['face_features'] as String?;
-      if (featureStr == null) continue;
+      final empId = emp['id'] as int;
 
-      List<List<double>> candidateVectors = [];
+      // Get pre-cached normalized vectors
+      final cachedVectors = await _localDb.getCachedVectorsForEmployee(empId);
+      if (cachedVectors.isEmpty) continue;
 
-      try {
-        final decoded = jsonDecode(featureStr);
-        if (decoded is List) {
-          if (decoded.isNotEmpty && decoded.first is List) {
-            candidateVectors = (decoded as List)
-                .map((e) => List<double>.from(e))
-                .toList();
-          } else {
-            candidateVectors = [List<double>.from(decoded)];
-          }
-        }
-      } catch (e) {
-        try {
-          final vectorList = featureStr
-              .replaceAll('[', '')
-              .replaceAll(']', '')
-              .split(',')
-              .map((e) => double.tryParse(e.trim()) ?? 0.0)
-              .toList();
-          candidateVectors = [vectorList];
-        } catch (_) {
-          continue;
-        }
-      }
-
-      for (final vectorList in candidateVectors) {
-        if (vectorList.length != embedding.length) continue;
-
-        double dotProduct = 0.0;
-        double normA = 0.0;
-        double normB = 0.0;
-
-        for (int i = 0; i < embedding.length; i++) {
-          dotProduct += embedding[i] * vectorList[i];
-          normA += embedding[i] * embedding[i];
-          normB += vectorList[i] * vectorList[i];
-        }
-
-        final score = dotProduct / (sqrt(normA) * sqrt(normB));
+      for (final vectorList in cachedVectors) {
+        // Fast dot product (no need to normalize again - vectors are pre-normalized)
+        final score = _fastDotProduct(normalizedEmbedding, vectorList);
 
         if (score > maxScore) {
           maxScore = score;
@@ -333,7 +511,7 @@ class SupabaseService {
     // Local didn't find a match. If online, fall back to server RPC (and trigger background sync if successful).
     if (await isOnline) {
       try {
-        final vectorStr = '[${embedding.join(',')}]';
+        final vectorStr = '[${normalizedEmbedding.join(',')}]';
         final response = await _client.rpc(
           'match_face',
           params: {
@@ -404,68 +582,79 @@ class SupabaseService {
   }
 
   Future<void> recordAttendance(int employeeId, String type) async {
-    // 1. Check local cache (prevents duplicate requests from this device)
-    if (await _localDb.hasLogForToday(employeeId, type)) {
-      throw Exception("Attendance already recorded today ($type)");
+    // Detect overtime scenario: employee has already completed a regular shift today
+    String effectiveType = type;
+
+    if (type == 'time-in') {
+      final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
+      final hasTimedOut = await _localDb.hasLogForToday(employeeId, 'time-out');
+
+      if (hasTimedIn && hasTimedOut) {
+        // Employee completed regular shift — this is an overtime-in
+        final hasOvertimeIn = await _localDb.hasLogForToday(
+          employeeId,
+          'overtime-in',
+        );
+        final hasOvertimeOut = await _localDb.hasLogForToday(
+          employeeId,
+          'overtime-out',
+        );
+
+        if (hasOvertimeIn && !hasOvertimeOut) {
+          throw Exception(
+            "You already have an active overtime session. Please time out from overtime first.",
+          );
+        }
+
+        effectiveType = 'overtime-in';
+      } else if (hasTimedIn && !hasTimedOut) {
+        throw Exception(
+          "Attendance already recorded today (time-in). Please time out first.",
+        );
+      }
+    } else if (type == 'time-out') {
+      final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
+      final hasTimedOut = await _localDb.hasLogForToday(employeeId, 'time-out');
+
+      if (hasTimedOut) {
+        // Already timed out — check for overtime-out scenario
+        final hasOvertimeIn = await _localDb.hasLogForToday(
+          employeeId,
+          'overtime-in',
+        );
+        final hasOvertimeOut = await _localDb.hasLogForToday(
+          employeeId,
+          'overtime-out',
+        );
+
+        if (hasOvertimeIn && !hasOvertimeOut) {
+          effectiveType = 'overtime-out';
+        } else {
+          throw Exception(
+            "You have already timed out and have no active overtime session.",
+          );
+        }
+      } else if (!hasTimedIn) {
+        final online = await isOnline;
+        if (!online) {
+          throw Exception("Cannot time-out without a prior time-in today.");
+        }
+      }
     }
 
     final now = DateTime.now();
-    final timeStr =
-        "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
 
-    if (await isOnline) {
-      try {
-        final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/attendance/log');
-        final response = await http.post(
-          url,
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': AppConfig.mobileApiKey,
-          },
-          body: jsonEncode({
-            'employeeId': employeeId,
-            'type': type,
-            'time': timeStr,
-            'timestamp': now.toIso8601String(),
-          }),
-        );
+    // Always save to the local database immediately to provide instant feedback
+    await _localDb.insertOfflineLog(employeeId, effectiveType, now);
 
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          // Success - Cache locally so we don't allow duplicates on this device
-          await _localDb.insertLog(employeeId, type, now, isSynced: true);
-          return;
-        } else if (response.statusCode >= 400 && response.statusCode < 500) {
-          // Client Error (e.g., 400 Bad Request, 404 Not Found)
-          // Do NOT fallback to offline. Throw error immediately.
-          final errorData = jsonDecode(response.body);
-          throw Exception(
-            errorData['error'] ?? 'Request failed: ${response.statusCode}',
-          );
-        } else {
-          // Server Error (5xx)
-          // Fallback to offline
-          throw HttpException('Server Error: ${response.statusCode}');
-        }
-      } catch (e) {
-        // If it's a specific logic error (4xx handled above), rethrow it.
-        // We detect this by checking if it's NOT a network/server type error.
-        // However, since we throw generic Exception for 4xx above, we need to be careful.
-        // Let's refine:
-
-        if (e.toString().contains('Request failed') ||
-            e.toString().contains('already recorded') ||
-            e.toString().contains('Shift not found')) {
-          rethrow;
-        }
-
-        debugPrint(
-          'Online attendance failed (Network/Server), falling back to offline: $e',
-        );
-        await _localDb.insertOfflineLog(employeeId, type, now);
+    // Fire and forget background sync to upload the log without blocking the user
+    isOnline.then((online) {
+      if (online) {
+        syncLogs().catchError((e) {
+          debugPrint('Background sync failed after recordAttendance: $e');
+        });
       }
-    } else {
-      await _localDb.insertOfflineLog(employeeId, type, now);
-    }
+    });
   }
 
   Future<String> uploadEmployeePhoto(int employeeId, File imageFile) async {
@@ -532,14 +721,29 @@ class SupabaseService {
       employeeId = employeeResponse['id'] as int;
 
       // 2. Upload Profile Picture (Use the first photo as primary)
+      String? uploadedPhotoUrl;
       try {
-        await uploadEmployeePhoto(employeeId, File(photoPaths.first));
+        uploadedPhotoUrl = await uploadEmployeePhoto(
+          employeeId,
+          File(photoPaths.first),
+        );
       } catch (e) {
         debugPrint("Warning: Failed to upload profile picture: $e");
-        // Non-fatal? Maybe. But we want a profile pic.
       }
 
-      // 3. Process All Photos -> Generate Embeddings -> Save as Golden
+      // 3. Update employee record with image_url if photo was uploaded
+      if (uploadedPhotoUrl != null) {
+        try {
+          await _client
+              .from('employees')
+              .update({'image_url': uploadedPhotoUrl})
+              .eq('id', employeeId);
+        } catch (e) {
+          debugPrint("Warning: Failed to update employee image_url: $e");
+        }
+      }
+
+      // 4. Process All Photos -> Generate Embeddings -> Save as Golden
       final FaceService faceService = FaceService();
       // Ensure initialized
       await faceService.initialize();
@@ -588,10 +792,33 @@ class SupabaseService {
   // ---------------------------------------------------------
 
   /// Fetches employees with photo URLs for the searchable selector.
-  /// Constructs photo URLs from the employee-photos storage bucket.
+  /// Reads from SQLite first for instant load, then syncs in background.
   Future<List<Map<String, dynamic>>> fetchEmployeesWithPhotos() async {
+    // First, try to load from local SQLite for instant response
+    final localEmployees = await _localDb.getAllEmployees();
+    if (localEmployees.isNotEmpty) {
+      // Trigger background sync for next time, but don't wait
+      syncEmployees();
+
+      return localEmployees
+          .map(
+            (emp) => <String, dynamic>{
+              'id': emp['id'],
+              'first_name': emp['first_name'] ?? '',
+              'last_name': emp['last_name'] ?? '',
+              'position': emp['position'] ?? '',
+              'photo_url': emp['image_url'],
+            },
+          )
+          .toList();
+    }
+
+    // If local is empty, try network as fallback
+    if (!await isOnline) {
+      return [];
+    }
+
     try {
-      // Fetch employees from Supabase directly
       final response = await _client
           .from('employees')
           .select('id, first_name, last_name, position, image_url')
@@ -603,7 +830,6 @@ class SupabaseService {
         final empId = emp['id'] as int;
         String? photoUrl = emp['image_url'] as String?;
 
-        // If no image_url, try to get the first photo from storage bucket
         if (photoUrl == null || photoUrl.isEmpty) {
           try {
             final files = await _client.storage
@@ -635,19 +861,7 @@ class SupabaseService {
       return employees;
     } catch (e) {
       debugPrint('Error fetching employees with photos: $e');
-      // Fallback to local DB
-      final localEmployees = await _localDb.getAllEmployees();
-      return localEmployees
-          .map(
-            (emp) => <String, dynamic>{
-              'id': emp['id'],
-              'first_name': emp['first_name'] ?? '',
-              'last_name': emp['last_name'] ?? '',
-              'position': emp['position'] ?? '',
-              'photo_url': null,
-            },
-          )
-          .toList();
+      return [];
     }
   }
 
@@ -657,64 +871,40 @@ class SupabaseService {
     List<double> embedding,
     int employeeId,
   ) async {
-    // Prefer OFFLINE verification for speed and to avoid repeated DB calls.
+    // Normalize input embedding
+    double norm = 0;
+    for (var x in embedding) {
+      norm += x * x;
+    }
+    norm = sqrt(norm);
+    if (norm < 1e-10) return null;
+
+    final normalizedEmbedding = embedding.map((x) => x / norm).toList();
+
+    // Prefer OFFLINE verification for speed using pre-normalized vectors
     debugPrint(
-      'Using Offline Targeted Verification for employee $employeeId...',
+      'Using Offline Targeted Verification for employee $employeeId with cached vectors...',
     );
-    final emp = await _localDb.getEmployee(employeeId);
-    if (emp != null) {
-      final featureStr = emp['face_features'] as String?;
-      if (featureStr != null) {
-        List<List<double>> candidateVectors = [];
 
-        try {
-          final decoded = jsonDecode(featureStr);
-          if (decoded is List) {
-            if (decoded.isNotEmpty && decoded.first is List) {
-              candidateVectors = (decoded as List)
-                  .map((e) => List<double>.from(e))
-                  .toList();
-            } else {
-              candidateVectors = [List<double>.from(decoded)];
-            }
-          }
-        } catch (e) {
-          try {
-            final vectorList = featureStr
-                .replaceAll('[', '')
-                .replaceAll(']', '')
-                .split(',')
-                .map((e) => double.tryParse(e.trim()) ?? 0.0)
-                .toList();
-            candidateVectors = [vectorList];
-          } catch (_) {
-            // fall through to RPC fallback below
-            candidateVectors = [];
-          }
+    // Get pre-cached normalized vectors
+    final cachedVectors = await _localDb.getCachedVectorsForEmployee(
+      employeeId,
+    );
+
+    if (cachedVectors.isNotEmpty) {
+      double maxScore = -1.0;
+
+      for (final vectorList in cachedVectors) {
+        // Fast dot product (vectors are pre-normalized)
+        final score = _fastDotProduct(normalizedEmbedding, vectorList);
+        if (score > maxScore) {
+          maxScore = score;
         }
+      }
 
-        double maxScore = -1.0;
-
-        for (final vectorList in candidateVectors) {
-          if (vectorList.length != embedding.length) continue;
-
-          double dotProduct = 0.0;
-          double normA = 0.0;
-          double normB = 0.0;
-
-          for (int i = 0; i < embedding.length; i++) {
-            dotProduct += embedding[i] * vectorList[i];
-            normA += embedding[i] * embedding[i];
-            normB += vectorList[i] * vectorList[i];
-          }
-
-          final score = dotProduct / (sqrt(normA) * sqrt(normB));
-          if (score > maxScore) {
-            maxScore = score;
-          }
-        }
-
-        if (maxScore >= 0.6) {
+      if (maxScore >= 0.6) {
+        final emp = await _localDb.getEmployee(employeeId);
+        if (emp != null) {
           return {
             'id': emp['id'],
             'first_name': emp['first_name'],
@@ -729,7 +919,7 @@ class SupabaseService {
     // Local verification didn't confirm. If online, fall back to RPC and trigger background sync if match found.
     if (await isOnline) {
       try {
-        final vectorStr = '[${embedding.join(',')}]';
+        final vectorStr = '[${normalizedEmbedding.join(',')}]';
         final response = await _client.rpc(
           'match_face',
           params: {

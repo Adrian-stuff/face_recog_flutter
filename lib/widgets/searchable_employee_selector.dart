@@ -1,7 +1,10 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import '../config/app_config.dart';
 
 /// A searchable employee selector that shows as a full-screen modal bottom sheet.
-/// Displays employee photos (from Supabase) with initials fallback.
+/// Displays employee photos (from API with proper caching) with initials fallback.
 class SearchableEmployeeSelector extends StatefulWidget {
   final List<Map<String, dynamic>> employees;
 
@@ -75,6 +78,75 @@ class _SearchableEmployeeSelectorState
       const Color(0xFF7CB342), // Light Green
     ];
     return colors[id % colors.length];
+  }
+
+  /// Builds avatar widget with proper caching and error handling
+  Widget _buildAvatarImage(Map<String, dynamic> emp) {
+    final empId = emp['id'] as int?;
+    final localImagePath = emp['local_image_path'] as String?;
+    final imageUrl = emp['photo_url'] as String?;
+
+    if (empId == null) {
+      return _buildInitialsAvatar(emp);
+    }
+
+    // Try local cached image first
+    if (localImagePath != null && localImagePath.isNotEmpty) {
+      final file = File(localImagePath);
+      if (file.existsSync()) {
+        return ClipOval(
+          child: Image.file(
+            file,
+            width: 52,
+            height: 52,
+            fit: BoxFit.cover,
+            errorBuilder: (context, error, stackTrace) {
+              debugPrint('Error loading local image for $empId: $error');
+              return _buildInitialsAvatar(emp);
+            },
+          ),
+        );
+      }
+    }
+
+    // Use cached network image with avatar endpoint
+    return ClipOval(
+      child: CachedNetworkImage(
+        imageUrl: AppConfig.getEmployeeAvatarUrl(empId),
+        fit: BoxFit.cover,
+        width: 52,
+        height: 52,
+        fadeInDuration: const Duration(milliseconds: 300),
+        placeholder: (context, url) {
+          return Center(
+            child: SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.white.withOpacity(0.7),
+              ),
+            ),
+          );
+        },
+        errorWidget: (context, url, error) {
+          debugPrint('Error loading avatar for employee $empId: $error');
+          // Try fallback to photo_url if avatar endpoint fails
+          if (imageUrl != null && imageUrl.isNotEmpty && url != imageUrl) {
+            return CachedNetworkImage(
+              imageUrl: imageUrl,
+              fit: BoxFit.cover,
+              width: 52,
+              height: 52,
+              errorWidget: (context, url, error) {
+                return _buildInitialsAvatar(emp);
+              },
+            );
+          }
+          return _buildInitialsAvatar(emp);
+        },
+      ),
+    );
   }
 
   @override
@@ -266,7 +338,6 @@ class _SearchableEmployeeSelectorState
   }
 
   Widget _buildEmployeeTile(Map<String, dynamic> emp) {
-    final photoUrl = emp['photo_url'] as String?;
     final empId = emp['id'] as int;
     final firstName = emp['first_name'] ?? '';
     final lastName = emp['last_name'] ?? '';
@@ -297,31 +368,7 @@ class _SearchableEmployeeSelectorState
                       ),
                     ],
                   ),
-                  child: photoUrl != null
-                      ? ClipOval(
-                          child: Image.network(
-                            photoUrl,
-                            fit: BoxFit.cover,
-                            width: 52,
-                            height: 52,
-                            errorBuilder: (_, __, ___) =>
-                                _buildInitialsAvatar(emp),
-                            loadingBuilder: (_, child, loadingProgress) {
-                              if (loadingProgress == null) return child;
-                              return Center(
-                                child: SizedBox(
-                                  width: 20,
-                                  height: 20,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    color: Colors.white.withOpacity(0.7),
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        )
-                      : _buildInitialsAvatar(emp),
+                  child: _buildAvatarImage(emp),
                 ),
               ),
               const SizedBox(width: 14),
