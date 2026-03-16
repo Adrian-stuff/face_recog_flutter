@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 ///
 /// During the colour-challenge phase the area *outside* the oval is
 /// tinted with [challengeColor] instead of the default dark scrim.
-class OvalFaceMask extends StatelessWidget {
+class OvalFaceMask extends StatefulWidget {
   /// Colour of the border drawn around the oval.
   final Color borderColor;
 
@@ -25,6 +25,13 @@ class OvalFaceMask extends StatelessWidget {
   });
 
   @override
+  State<OvalFaceMask> createState() => _OvalFaceMaskState();
+}
+
+class _OvalFaceMaskState extends State<OvalFaceMask> {
+  Size? _lastSize;
+
+  @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -39,17 +46,22 @@ class OvalFaceMask extends StatelessWidget {
           height: ovalHeight,
         );
 
-        // Report the oval rect back to the parent.
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          onOvalRect?.call(ovalRect);
-        });
+        // Report the oval rect back to the parent only on layout change
+        if (_lastSize != size) {
+          _lastSize = size;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              widget.onOvalRect?.call(ovalRect);
+            }
+          });
+        }
 
         return CustomPaint(
           size: size,
           painter: _OvalMaskPainter(
             ovalRect: ovalRect,
-            borderColor: borderColor,
-            challengeColor: challengeColor,
+            borderColor: widget.borderColor,
+            challengeColor: widget.challengeColor,
           ),
         );
       },

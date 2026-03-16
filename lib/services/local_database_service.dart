@@ -11,7 +11,7 @@ class LocalDatabaseService {
   LocalDatabaseService._internal();
 
   Database? _database;
-  
+
   // In-memory caches for pre-decoded and pre-normalized vectors
   // Maps employeeId -> List of {vector, norm, isGolden}
   final Map<int, List<Map<String, dynamic>>> _vectorCache = {};
@@ -79,7 +79,9 @@ class LocalDatabaseService {
           ''');
         }
         if (oldVersion < 3) {
-          await db.execute('ALTER TABLE employees ADD COLUMN local_image_path TEXT');
+          await db.execute(
+            'ALTER TABLE employees ADD COLUMN local_image_path TEXT',
+          );
         }
       },
     );
@@ -90,7 +92,7 @@ class LocalDatabaseService {
   /// Pre-decode and normalize vectors for fast comparison
   static List<double>? _decodeVector(String? featureStr) {
     if (featureStr == null || featureStr.isEmpty) return null;
-    
+
     try {
       final decoded = jsonDecode(featureStr);
       if (decoded is List) {
@@ -118,10 +120,10 @@ class LocalDatabaseService {
 
   Future<void> syncEmployees(List<Map<String, dynamic>> employees) async {
     final db = await database;
-    
+
     // Clear cache before syncing
     _vectorCache.clear();
-    
+
     await db.transaction((txn) async {
       await txn.delete('employees');
       for (var emp in employees) {
@@ -137,64 +139,92 @@ class LocalDatabaseService {
         });
       }
     });
-    
+
     // Pre-decode and normalize vectors in-memory
     await _initializeVectorCache();
-    
-    debugPrint('Synced ${employees.length} employees to local DB with pre-normalized vectors');
+
+    debugPrint(
+      'Synced ${employees.length} employees to local DB with pre-normalized vectors',
+    );
   }
-  
+
   /// Initialize vector cache by decoding and normalizing all vectors
   Future<void> _initializeVectorCache() async {
     if (_cacheInitialized) return;
-    
+
     final db = await database;
     final employees = await db.query('employees');
-    
+
     for (var emp in employees) {
       final empId = emp['id'] as int;
       final featureStr = emp['face_features'] as String?;
-      
+
       if (featureStr == null || featureStr.isEmpty) continue;
-      
+
       try {
         final decoded = jsonDecode(featureStr);
-        final List<List<double>> vectors = [];
-        
-        if (decoded is List) {
-          if (decoded.isNotEmpty && decoded.first is List) {
-            // Multiple vectors: [[...], [...], ...]
-            for (var v in decoded) {
-              if (v is List && v.isNotEmpty) {
-                vectors.add(List<double>.from(v));
+        final List<Map<String, dynamic>> entries = [];
+
+        if (decoded is List && decoded.isNotEmpty) {
+          final first = decoded.first;
+          if (first is Map) {
+            // New enriched format: [{"descriptor": [...], "is_golden": true}, ...]
+            for (var item in decoded) {
+              if (item is Map) {
+                final desc = item['descriptor'];
+                final isGolden = item['is_golden'] == true;
+                if (desc is List && desc.isNotEmpty) {
+                  entries.add({
+                    'descriptor': List<double>.from(desc),
+                    'isGolden': isGolden,
+                  });
+                }
               }
             }
-          } else if (decoded.isNotEmpty && decoded.first is num) {
-            // Single vector: [...]
-            vectors.add(List<double>.from(decoded));
+          } else if (first is List) {
+            // Legacy format: [[...], [...], ...] — treat all as non-golden
+            for (var v in decoded) {
+              if (v is List && v.isNotEmpty) {
+                entries.add({
+                  'descriptor': List<double>.from(v),
+                  'isGolden': false,
+                });
+              }
+            }
+          } else if (first is num) {
+            // Legacy single vector: [...] — treat as non-golden
+            entries.add({
+              'descriptor': List<double>.from(decoded),
+              'isGolden': false,
+            });
           }
         }
-        
-        // Pre-normalize all vectors
-        _vectorCache[empId] = vectors.map((v) {
-          final normalized = _normalizeVectorInPlace(v);
-          final norm = _normalizeVector(v);
-          return {
-            'vector': normalized,
-            'norm': norm,
-          };
+
+        // Pre-normalize all vectors and store with isGolden
+        _vectorCache[empId] = entries.map((e) {
+          final vec = e['descriptor'] as List<double>;
+          final normalized = _normalizeVectorInPlace(vec);
+          return {'vector': normalized, 'isGolden': e['isGolden'] as bool};
         }).toList();
-        
-        debugPrint('Cached ${vectors.length} normalized vectors for employee $empId');
+
+        final goldenCount = _vectorCache[empId]!
+            .where((e) => e['isGolden'] == true)
+            .length;
+        debugPrint(
+          'Cached ${entries.length} vectors for employee $empId ($goldenCount golden)',
+        );
       } catch (e) {
         debugPrint('Error caching vectors for employee $empId: $e');
       }
     }
-    
+
     _cacheInitialized = true;
   }
 
-  Future<void> updateEmployeeLocalImagePath(int employeeId, String localPath) async {
+  Future<void> updateEmployeeLocalImagePath(
+    int employeeId,
+    String localPath,
+  ) async {
     final db = await database;
     await db.update(
       'employees',
@@ -206,26 +236,31 @@ class LocalDatabaseService {
 
   // --- Offline Verification Methods ---
 
-  /// Get cached normalized vectors for an employee (O(1) lookup)
-  Future<List<List<double>>> getCachedVectorsForEmployee(int employeeId) async {
+  /// Get cached normalized vector entries for an employee, including isGolden flag.
+  /// Returns a list of maps with keys 'vector' (List<double>) and 'isGolden' (bool).
+  Future<List<Map<String, dynamic>>> getCachedVectorEntriesForEmployee(
+    int employeeId,
+  ) async {
     if (!_cacheInitialized) await _initializeVectorCache();
-    
-    final cached = _vectorCache[employeeId];
-    if (cached != null) {
-      return cached.map((item) => item['vector'] as List<double>).toList();
-    }
-    return [];
+    return _vectorCache[employeeId] ?? [];
+  }
+
+  /// Get cached normalized vectors for an employee (O(1) lookup).
+  /// Legacy convenience wrapper — does not include isGolden metadata.
+  Future<List<List<double>>> getCachedVectorsForEmployee(int employeeId) async {
+    final entries = await getCachedVectorEntriesForEmployee(employeeId);
+    return entries.map((e) => e['vector'] as List<double>).toList();
   }
 
   Future<List<Map<String, dynamic>>> getAllEmployees() async {
     final db = await database;
     final result = await db.query('employees');
-    
+
     // Ensure cache is initialized
     if (!_cacheInitialized) {
       await _initializeVectorCache();
     }
-    
+
     return result;
   }
 
@@ -236,12 +271,12 @@ class LocalDatabaseService {
       where: 'id = ?',
       whereArgs: [id],
     );
-    
+
     // Ensure cache is initialized
     if (!_cacheInitialized) {
       await _initializeVectorCache();
     }
-    
+
     return results.isNotEmpty ? results.first : null;
   }
 

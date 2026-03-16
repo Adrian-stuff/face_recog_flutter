@@ -37,6 +37,8 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
   String? _errorMessage;
   double? _originalBrightness;
   Timer? _timeoutTimer;
+  double? _leftEyeProb;
+  double? _rightEyeProb;
 
   // Animation for the oval border pulse.
   late final AnimationController _pulseController;
@@ -144,8 +146,12 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
           }
         } else {
           face = result['face'] as Face?;
-          if (mounted && _errorMessage != null) {
-            setState(() => _errorMessage = null);
+          if (mounted) {
+            _leftEyeProb = result['leftEyeOpen'] as double?;
+            _rightEyeProb = result['rightEyeOpen'] as double?;
+            if (_errorMessage != null) {
+              setState(() => _errorMessage = null);
+            }
           }
         }
 
@@ -295,37 +301,65 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
             bottom: 120,
             left: 24,
             right: 24,
-            child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 300),
-              child: Container(
-                key: ValueKey(_errorMessage ?? phase.toString()),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 20,
-                  vertical: 14,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.black.withAlpha(180),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(
-                    color: _errorMessage != null
-                        ? Colors.red.withAlpha(160)
-                        : borderColor.withAlpha(100),
-                    width: 1,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 300),
+                  child: Container(
+                    key: ValueKey(_errorMessage ?? phase.toString()),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 14,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withAlpha(180),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: _errorMessage != null
+                            ? Colors.red.withAlpha(160)
+                            : borderColor.withAlpha(100),
+                        width: 1,
+                      ),
+                    ),
+                    child: Text(
+                      _errorMessage ?? _liveness.instruction,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: _errorMessage != null
+                            ? Colors.redAccent
+                            : Colors.white,
+                        fontSize: 20,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.3,
+                      ),
+                    ),
                   ),
                 ),
-                child: Text(
-                  _errorMessage ?? _liveness.instruction,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: _errorMessage != null
-                        ? Colors.redAccent
-                        : Colors.white,
-                    fontSize: 20,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 0.3,
+                if (kDebugMode && _leftEyeProb != null && _rightEyeProb != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 16),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withAlpha(150),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        'L: ${(_leftEyeProb! * 100).toStringAsFixed(0)}% | R: ${(_rightEyeProb! * 100).toStringAsFixed(0)}%',
+                        style: const TextStyle(
+                          color: Colors.greenAccent,
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ),
                   ),
-                ),
-              ),
+              ],
             ),
           ),
 

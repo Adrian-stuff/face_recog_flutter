@@ -31,8 +31,8 @@ class LivenessService {
   bool _sawEyesClosed = false;
   static const int _requiredClosedFrames = 1;
   static const int _requiredOpenFrames = 1;
-  static const double _closedThreshold = 0.4;
-  static const double _openThreshold = 0.6;
+  static const double _closedThreshold = 0.45;
+  static const double _openThreshold = 0.55;
 
   // ── Color challenge ────────────────────────────────────────────
   int _currentColorIndex = 0;
@@ -140,7 +140,7 @@ class LivenessService {
 
     if (!_sawEyesClosed) {
       // Wait for eyes to close (probability drops below threshold).
-      if (leftEye < _closedThreshold && rightEye < _closedThreshold) {
+      if (leftEye < _closedThreshold || rightEye < _closedThreshold) {
         _eyesClosedFrames++;
         if (_eyesClosedFrames >= _requiredClosedFrames) {
           _sawEyesClosed = true;
@@ -153,7 +153,7 @@ class LivenessService {
       }
     } else {
       // Wait for eyes to re-open (probability rises above threshold).
-      if (leftEye > _openThreshold && rightEye > _openThreshold) {
+      if (leftEye > _openThreshold || rightEye > _openThreshold) {
         _eyesOpenAfterCloseFrames++;
         if (_eyesOpenAfterCloseFrames >= _requiredOpenFrames) {
           debugPrint('[Liveness] Blink confirmed — liveness passed');

@@ -57,6 +57,9 @@ class SupabaseService {
 
         String? descriptorStr;
         if (features != null && features is List && features.isNotEmpty) {
+          // New format: [{descriptor: [...], is_golden: bool}, ...]
+          // We store the whole enriched list so the local cache knows which are golden.
+          // Legacy format (plain list of arrays) is also handled in _initializeVectorCache.
           descriptorStr = jsonEncode(features);
         }
 
@@ -483,13 +486,22 @@ class SupabaseService {
     for (var emp in employees) {
       final empId = emp['id'] as int;
 
-      // Get pre-cached normalized vectors
-      final cachedVectors = await _localDb.getCachedVectorsForEmployee(empId);
-      if (cachedVectors.isEmpty) continue;
+      // Get pre-cached normalized vectors with golden metadata
+      final cachedEntries = await _localDb.getCachedVectorEntriesForEmployee(
+        empId,
+      );
+      if (cachedEntries.isEmpty) continue;
 
-      for (final vectorList in cachedVectors) {
+      for (final entry in cachedEntries) {
+        final vectorList = entry['vector'] as List<double>;
+        final isGolden = entry['isGolden'] as bool;
+
         // Fast dot product (no need to normalize again - vectors are pre-normalized)
-        final score = _fastDotProduct(normalizedEmbedding, vectorList);
+        double score = _fastDotProduct(normalizedEmbedding, vectorList);
+
+        // Golden encodings get a small boost to prioritize high-quality reference data.
+        // Boost is 5% so a golden score of 0.952+ beats a non-golden 1.0 only when close.
+        if (isGolden) score = (score * 1.05).clamp(-1.0, 1.0);
 
         if (score > maxScore) {
           maxScore = score;
