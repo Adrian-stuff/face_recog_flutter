@@ -618,6 +618,12 @@ class SupabaseService {
           );
         }
 
+        if (hasOvertimeIn && hasOvertimeOut) {
+          throw Exception(
+            "You have already completed an overtime session today. Only one overtime session per day is allowed.",
+          );
+        }
+
         effectiveType = 'overtime-in';
       } else if (hasTimedIn && !hasTimedOut) {
         throw Exception(
@@ -641,6 +647,10 @@ class SupabaseService {
 
         if (hasOvertimeIn && !hasOvertimeOut) {
           effectiveType = 'overtime-out';
+        } else if (hasOvertimeIn && hasOvertimeOut) {
+          throw Exception(
+            "You have already completed an overtime session today.",
+          );
         } else {
           throw Exception(
             "You have already timed out and have no active overtime session.",
