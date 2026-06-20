@@ -51,7 +51,15 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
     _connectivitySubscription = Connectivity().onConnectivityChanged.listen((
       results,
     ) {
-      final isConnected = results.any((r) => r != ConnectivityResult.none);
+      final isConnected = results.isNotEmpty && !results.contains(ConnectivityResult.none);
+
+      // Trigger sync if we just came online
+      if (isConnected && !_isConnected) {
+        _supabaseService.syncLogs().catchError((e) => debugPrint('Immediate syncLogs failed: $e'));
+        _supabaseService.syncEncodings().catchError((e) => debugPrint('Immediate syncEncodings failed: $e'));
+        _supabaseService.syncEmployees().catchError((e) => debugPrint('Immediate syncEmployees failed: $e'));
+      }
+
       if (mounted) setState(() => _isConnected = isConnected);
     });
   }

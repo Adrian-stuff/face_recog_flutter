@@ -25,6 +25,10 @@ class SupabaseService {
   /// Check internet connectivity
   Future<bool> get isOnline async {
     final connectivityResult = await Connectivity().checkConnectivity();
+    if (connectivityResult is List) {
+      return (connectivityResult as List).isNotEmpty &&
+          !(connectivityResult as List).contains(ConnectivityResult.none);
+    }
     return connectivityResult != ConnectivityResult.none;
   }
 
