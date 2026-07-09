@@ -54,6 +54,13 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
   int _stableFrames = 0;
   static const int _requiredStableFrames = 10;
 
+  // Live angle readout, updated every frame so the instruction text and
+  // directional arrow can react to the user's motion in real time instead
+  // of only reporting a binary "aligned or not" once they cross the
+  // threshold.
+  double _currentYaw = 0;
+  double _currentPitch = 0;
+
   @override
   void initState() {
     super.initState();
@@ -221,6 +228,12 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
         break;
     }
 
+    // Update the live readout every frame (not just on alignment changes)
+    // so the instruction text and directional arrow can track the user's
+    // motion continuously, not just jump when they cross the threshold.
+    _currentYaw = yaw;
+    _currentPitch = pitch;
+
     if (isAligned) {
       _stableFrames++;
       if (mounted) setState(() {}); // Trigger refresh for progress/feedback
@@ -230,10 +243,44 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
         _advanceStep();
       }
     } else {
-      if (_stableFrames > 0) {
-        _stableFrames = 0;
-        if (mounted) setState(() {});
-      }
+      _stableFrames = 0;
+      if (mounted) setState(() {});
+    }
+  }
+
+  /// How close the current yaw/pitch is to satisfying the active step's
+  /// threshold: 0.0 (facing the wrong way / just starting) to 1.0 (aligned).
+  /// Drives the live "almost there" text and the directional arrow's glow.
+  double get _stepAngleProgress {
+    switch (_captureStep) {
+      case CaptureStep.left:
+        return (_currentYaw / _yawThreshold).clamp(0.0, 1.0);
+      case CaptureStep.right:
+        return (-_currentYaw / _yawThreshold).clamp(0.0, 1.0);
+      case CaptureStep.up:
+        return (_currentPitch / _pitchThreshold).clamp(0.0, 1.0);
+      case CaptureStep.down:
+        return (-_currentPitch / _pitchThreshold).clamp(0.0, 1.0);
+      case CaptureStep.center:
+        final offCenter = (_currentYaw.abs() + _currentPitch.abs()) / 2;
+        return (1 - (offCenter / 10)).clamp(0.0, 1.0);
+      default:
+        return 0.0;
+    }
+  }
+
+  IconData? get _directionIcon {
+    switch (_captureStep) {
+      case CaptureStep.left:
+        return Icons.chevron_left;
+      case CaptureStep.right:
+        return Icons.chevron_right;
+      case CaptureStep.up:
+        return Icons.keyboard_arrow_up;
+      case CaptureStep.down:
+        return Icons.keyboard_arrow_down;
+      default:
+        return null;
     }
   }
 
@@ -308,17 +355,27 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
       return _liveness.instruction;
     }
 
+    if (_stableFrames > 0) return "Perfect! Hold still...";
+
     switch (_captureStep) {
       case CaptureStep.center:
         return "Look Straight Ahead";
       case CaptureStep.left:
-        return "Turn Head Slightly LEFT";
+        if (_currentYaw <= 0) return "Turn your head to the LEFT";
+        if (_stepAngleProgress < 0.5) return "Keep turning LEFT...";
+        return "Almost there — a bit more LEFT";
       case CaptureStep.right:
-        return "Turn Head Slightly RIGHT";
+        if (_currentYaw >= 0) return "Turn your head to the RIGHT";
+        if (_stepAngleProgress < 0.5) return "Keep turning RIGHT...";
+        return "Almost there — a bit more RIGHT";
       case CaptureStep.up:
-        return "Look UP";
+        if (_currentPitch <= 0) return "Tilt your head UP";
+        if (_stepAngleProgress < 0.5) return "Keep tilting UP...";
+        return "Almost there — a bit more UP";
       case CaptureStep.down:
-        return "Look DOWN";
+        if (_currentPitch >= 0) return "Tilt your head DOWN";
+        if (_stepAngleProgress < 0.5) return "Keep tilting DOWN...";
+        return "Almost there — a bit more DOWN";
       case CaptureStep.completed:
         return "All Done!";
       default:
@@ -383,7 +440,7 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
         case LivenessPhase.positionFace:
           borderColor = Colors.white;
           break;
-        case LivenessPhase.blink:
+        case LivenessPhase.gesture:
           borderColor = Colors.amber;
           break;
         case LivenessPhase.passed:
@@ -427,6 +484,17 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
             },
           ),
 
+          // Directional arrow beside the oval — glows brighter as the user
+          // turns closer to the target angle, so left/right/up/down have a
+          // continuous visual cue instead of only a text label.
+          if (_directionIcon != null && _liveness.ovalRect != null)
+            _DirectionArrow(
+              step: _captureStep,
+              icon: _directionIcon!,
+              progress: _stepAngleProgress,
+              ovalRect: _liveness.ovalRect!,
+            ),
+
           // Instruction
           Positioned(
             bottom: 120,
@@ -461,6 +529,27 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
                     ),
                   ),
                 ),
+                if (_directionIcon != null) ...[
+                  const SizedBox(height: 12),
+                  // Live "how close am I" gauge for the current angle step —
+                  // distinct from the overall 5-step progress bar below, so
+                  // the user sees moment-to-moment feedback while turning.
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: LinearProgressIndicator(
+                      value: _stepAngleProgress,
+                      backgroundColor: Colors.white.withAlpha(40),
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        Color.lerp(
+                          Colors.orangeAccent,
+                          Colors.greenAccent,
+                          _stepAngleProgress,
+                        )!,
+                      ),
+                      minHeight: 6,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 20),
                 if (_captureStep != CaptureStep.liveness)
                   // Progress Bar
@@ -523,5 +612,80 @@ class _MultiAngleCaptureScreenState extends State<MultiAngleCaptureScreen>
     _restoreBrightness();
     WakelockPlus.disable();
     super.dispose();
+  }
+}
+
+/// Directional arrow positioned beside the face oval, pointing which way to
+/// turn. Dims when the user is far from the target angle and brightens to
+/// green as [progress] approaches 1.0, giving continuous feedback instead
+/// of a single before/after state.
+class _DirectionArrow extends StatelessWidget {
+  const _DirectionArrow({
+    required this.step,
+    required this.icon,
+    required this.progress,
+    required this.ovalRect,
+  });
+
+  final CaptureStep step;
+  final IconData icon;
+  final double progress;
+  final Rect ovalRect;
+
+  static const double _size = 64;
+
+  @override
+  Widget build(BuildContext context) {
+    double left;
+    double top;
+    switch (step) {
+      case CaptureStep.left:
+        left = ovalRect.left - _size - 8;
+        top = ovalRect.center.dy - _size / 2;
+        break;
+      case CaptureStep.right:
+        left = ovalRect.right + 8;
+        top = ovalRect.center.dy - _size / 2;
+        break;
+      case CaptureStep.up:
+        left = ovalRect.center.dx - _size / 2;
+        top = ovalRect.top - _size - 8;
+        break;
+      case CaptureStep.down:
+        left = ovalRect.center.dx - _size / 2;
+        top = ovalRect.bottom + 8;
+        break;
+      default:
+        left = ovalRect.center.dx - _size / 2;
+        top = ovalRect.top - _size - 8;
+    }
+
+    final color = Color.lerp(Colors.white, Colors.greenAccent, progress)!;
+    // Dim + shrink when far from the target, full-size and glowing once close.
+    final opacity = 0.35 + (progress * 0.65);
+    final scale = 0.8 + (progress * 0.3);
+
+    return Positioned(
+      left: left,
+      top: top,
+      child: IgnorePointer(
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 150),
+          opacity: opacity,
+          child: AnimatedScale(
+            duration: const Duration(milliseconds: 150),
+            scale: scale,
+            child: Icon(
+              icon,
+              size: _size,
+              color: color,
+              shadows: progress > 0.8
+                  ? [Shadow(color: color, blurRadius: 16)]
+                  : null,
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }

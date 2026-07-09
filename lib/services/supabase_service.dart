@@ -13,6 +13,23 @@ import '../config/app_config.dart';
 import 'local_database_service.dart';
 import 'face_service.dart';
 
+/// Snapshot of offline records still waiting to sync or that the server
+/// permanently rejected (e.g. too old, or a genuine conflict).
+class SyncStatus {
+  final int pendingCount;
+  final List<Map<String, dynamic>> failedLogs;
+  final List<Map<String, dynamic>> failedEncodings;
+
+  SyncStatus({
+    required this.pendingCount,
+    required this.failedLogs,
+    required this.failedEncodings,
+  });
+
+  int get failedCount => failedLogs.length + failedEncodings.length;
+  bool get hasIssues => pendingCount > 0 || failedCount > 0;
+}
+
 class SupabaseService {
   static final SupabaseService _instance = SupabaseService._internal();
   factory SupabaseService() => _instance;
@@ -21,6 +38,8 @@ class SupabaseService {
   final SupabaseClient _client = Supabase.instance.client;
   final LocalDatabaseService _localDb = LocalDatabaseService();
   Timer? _syncTimer;
+  StreamSubscription<List<ConnectivityResult>>? _reconnectSyncSubscription;
+  bool _wasOnline = true;
 
   /// Check internet connectivity
   Future<bool> get isOnline async {
@@ -209,6 +228,33 @@ class SupabaseService {
   }
 
   /// Syncs offline logs to Supabase (Up Sync)
+  /// Pulls the "error" field out of a JSON error response, falling back to
+  /// the raw body if it isn't the expected shape.
+  String _extractErrorMessage(String responseBody) {
+    try {
+      final decoded = jsonDecode(responseBody);
+      if (decoded is Map && decoded['error'] is String) {
+        return decoded['error'] as String;
+      }
+    } catch (_) {}
+    return responseBody;
+  }
+
+  /// Counts of records still waiting to sync or that permanently failed —
+  /// surfaced in the UI so an outage isn't invisible until logs start
+  /// aging out of the server's sync window.
+  Future<SyncStatus> getSyncStatus() async {
+    final pendingLogs = await _localDb.getPendingLogsCount();
+    final pendingEncodings = await _localDb.getPendingEncodingsCount();
+    final failedLogs = await _localDb.getFailedLogs();
+    final failedEncodings = await _localDb.getFailedEncodings();
+    return SyncStatus(
+      pendingCount: pendingLogs + pendingEncodings,
+      failedLogs: failedLogs,
+      failedEncodings: failedEncodings,
+    );
+  }
+
   Future<void> syncLogs() async {
     if (!await isOnline) return;
 
@@ -239,10 +285,13 @@ class SupabaseService {
           // Mark as synced only if successful
           await _localDb.markLogsAsSynced([log['id'] as int]);
         } else if (response.statusCode >= 400 && response.statusCode < 500) {
-          // Client error (e.g. 'Already timed in'). Retrying won't fix it.
-          // We mark it as synced to remove it from the pending sync queue.
-          debugPrint('Client error syncing log ${log['id']}: ${response.body}');
-          await _localDb.markLogsAsSynced([log['id'] as int]);
+          // Client error (e.g. 'Already timed in', or too old to sync).
+          // Retrying won't fix it, but unlike a real success this must stay
+          // visible — silently discarding it would mean this attendance
+          // record is gone with no trace anywhere.
+          final reason = _extractErrorMessage(response.body);
+          debugPrint('Client error syncing log ${log['id']}: $reason');
+          await _localDb.markLogsAsFailed([log['id'] as int], reason);
         } else {
           debugPrint(
             'Failed to sync log ${log['id']} (Server error): ${response.body}',
@@ -283,10 +332,9 @@ class SupabaseService {
         if (response.statusCode >= 200 && response.statusCode < 300) {
           await _localDb.markEncodingsAsSynced([enc['id'] as int]);
         } else if (response.statusCode >= 400 && response.statusCode < 500) {
-          debugPrint(
-            'Client error syncing encoding ${enc['id']}: ${response.body}',
-          );
-          await _localDb.markEncodingsAsSynced([enc['id'] as int]);
+          final reason = _extractErrorMessage(response.body);
+          debugPrint('Client error syncing encoding ${enc['id']}: $reason');
+          await _localDb.markEncodingsAsFailed([enc['id'] as int], reason);
         } else {
           debugPrint('Failed to sync encoding ${enc['id']}: ${response.body}');
         }
@@ -319,6 +367,27 @@ class SupabaseService {
           }
         } catch (e) {
           debugPrint('Background sync tick failed: $e');
+        }
+      });
+
+      // Lives here (service-level singleton) rather than on any one screen,
+      // so a reconnect is caught regardless of which screen happens to be
+      // active — the periodic timer above would otherwise be the only
+      // catch-up path, up to 5 minutes after the network actually returns.
+      _reconnectSyncSubscription?.cancel();
+      _reconnectSyncSubscription = Connectivity().onConnectivityChanged.listen((
+        results,
+      ) {
+        final isConnected = results.any((r) => r != ConnectivityResult.none);
+        final justReconnected = isConnected && !_wasOnline;
+        _wasOnline = isConnected;
+        if (justReconnected) {
+          syncLogs().catchError((e) {
+            debugPrint('Reconnect sync (logs) failed: $e');
+          });
+          syncEncodings().catchError((e) {
+            debugPrint('Reconnect sync (encodings) failed: $e');
+          });
         }
       });
     } catch (e) {
@@ -574,13 +643,7 @@ class SupabaseService {
     List<double> embedding,
   ) async {
     try {
-      final employeeResponse = await _client
-          .from('employees')
-          .insert(employeeData)
-          .select()
-          .single();
-
-      final employeeId = employeeResponse['id'] as int;
+      final employeeId = await _createEmployee(employeeData);
       await saveFaceDescriptor(employeeId, embedding, isGolden: true);
 
       // Trigger sync to update local cache immediately
@@ -591,6 +654,29 @@ class SupabaseService {
       debugPrint('Error registering employee: $e');
       rethrow;
     }
+  }
+
+  /// Creates the employee record via the Next.js API (follows
+  /// AppConfig.nextJsBaseUrl — local dev server or production).
+  Future<int> _createEmployee(Map<String, dynamic> employeeData) async {
+    final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/employees');
+    final response = await http.post(
+      url,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': AppConfig.mobileApiKey,
+      },
+      body: jsonEncode(employeeData),
+    );
+
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Failed to create employee: ${response.statusCode} ${response.body}',
+      );
+    }
+
+    final body = jsonDecode(response.body) as Map<String, dynamic>;
+    return body['id'] as int;
   }
 
   Future<void> recordAttendance(int employeeId, String type) async {
@@ -680,35 +766,28 @@ class SupabaseService {
   }
 
   Future<String> uploadEmployeePhoto(int employeeId, File imageFile) async {
-    if (!await isOnline)
+    if (!await isOnline) {
       throw Exception("Cannot upload: Check internet connection");
-
-    final user = _client.auth.currentUser;
-    debugPrint(
-      "DEBUG: Uploading photo. User: ${user?.id}, Email: ${user?.email}",
-    );
-
-    if (user == null) {
-      throw Exception("Unauthorized: No active session. Please log in again.");
     }
 
     try {
-      final fileName =
-          '${employeeId}_${DateTime.now().millisecondsSinceEpoch}.jpg';
-      final path = '$employeeId/$fileName';
+      final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/employees/photo');
+      final request = http.MultipartRequest('POST', url)
+        ..headers['x-api-key'] = AppConfig.mobileApiKey
+        ..fields['employeeId'] = employeeId.toString()
+        ..files.add(await http.MultipartFile.fromPath('file', imageFile.path));
 
-      await _client.storage
-          .from('employee-photos')
-          .upload(
-            path,
-            imageFile,
-            fileOptions: const FileOptions(cacheControl: '3600', upsert: false),
-          );
+      final streamedResponse = await request.send();
+      final response = await http.Response.fromStream(streamedResponse);
 
-      final publicUrl = _client.storage
-          .from('employee-photos')
-          .getPublicUrl(path);
-      return publicUrl;
+      if (response.statusCode != 200) {
+        throw Exception(
+          'Failed to upload photo: ${response.statusCode} ${response.body}',
+        );
+      }
+
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      return body['url'] as String;
     } catch (e) {
       debugPrint('Error uploading photo: $e');
       throw Exception('Photo upload failed: ${e.toString()}');
@@ -729,18 +808,8 @@ class SupabaseService {
 
     int? employeeId;
     try {
-      // 1. Insert Employee Record (without embedding initially, or we insert empty)
-      // We reuse registerEmployee but we need a dummy embedding or change logic.
-      // But registerEmployee takes an embedding.
-      // Let's modify the flow: Insert employee separately first.
-
-      final employeeResponse = await _client
-          .from('employees')
-          .insert(employeeData)
-          .select()
-          .single();
-
-      employeeId = employeeResponse['id'] as int;
+      // 1. Insert Employee Record (without embedding initially)
+      employeeId = await _createEmployee(employeeData);
 
       // 2. Upload Profile Picture (Use the first photo as primary)
       String? uploadedPhotoUrl;
@@ -756,10 +825,17 @@ class SupabaseService {
       // 3. Update employee record with image_url if photo was uploaded
       if (uploadedPhotoUrl != null) {
         try {
-          await _client
-              .from('employees')
-              .update({'image_url': uploadedPhotoUrl})
-              .eq('id', employeeId);
+          final url = Uri.parse(
+            '${AppConfig.nextJsBaseUrl}/api/employees?id=$employeeId',
+          );
+          await http.patch(
+            url,
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': AppConfig.mobileApiKey,
+            },
+            body: jsonEncode({'image_url': uploadedPhotoUrl}),
+          );
         } catch (e) {
           debugPrint("Warning: Failed to update employee image_url: $e");
         }
@@ -790,15 +866,23 @@ class SupabaseService {
         );
       }
 
-      // 4. Trigger Sync
-      syncEmployees(); // Fire and forget or await? best to await if we want immediate feedback
+      // 4. Sync so the local cache (and home screen) reflects the new
+      // employee/photo immediately instead of waiting for the next
+      // background sync cycle.
+      await syncEmployees();
 
       return employeeId;
     } catch (e) {
       debugPrint('Registration with photos failed: $e');
       if (employeeId != null) {
         try {
-          await _client.from('employees').delete().eq('id', employeeId);
+          final url = Uri.parse(
+            '${AppConfig.nextJsBaseUrl}/api/employees?id=$employeeId',
+          );
+          await http.delete(
+            url,
+            headers: {'x-api-key': AppConfig.mobileApiKey},
+          );
         } catch (deleteError) {
           debugPrint(
             'CRITICAL: Failed to rollback employee $employeeId: $deleteError',
@@ -821,70 +905,37 @@ class SupabaseService {
     if (localEmployees.isNotEmpty) {
       // Trigger background sync for next time, but don't wait
       syncEmployees();
-
-      return localEmployees
-          .map(
-            (emp) => <String, dynamic>{
-              'id': emp['id'],
-              'first_name': emp['first_name'] ?? '',
-              'last_name': emp['last_name'] ?? '',
-              'position': emp['position'] ?? '',
-              'photo_url': emp['image_url'],
-            },
-          )
-          .toList();
+      return _mapLocalEmployees(localEmployees);
     }
 
-    // If local is empty, try network as fallback
+    // Local cache is empty (e.g. first launch on this device) — sync via
+    // the Next.js API (same path as syncEmployees()/AppConfig.nextJsBaseUrl,
+    // so this transparently follows whatever server the app is pointed at —
+    // production or a local dev server — instead of querying Supabase
+    // directly and bypassing that config).
     if (!await isOnline) {
       return [];
     }
 
-    try {
-      final response = await _client
-          .from('employees')
-          .select('id, first_name, last_name, position, image_url')
-          .order('first_name', ascending: true);
+    await syncEmployees();
+    final synced = await _localDb.getAllEmployees();
+    return _mapLocalEmployees(synced);
+  }
 
-      final List<Map<String, dynamic>> employees = [];
-
-      for (final emp in response) {
-        final empId = emp['id'] as int;
-        String? photoUrl = emp['image_url'] as String?;
-
-        if (photoUrl == null || photoUrl.isEmpty) {
-          try {
-            final files = await _client.storage
-                .from('employee-photos')
-                .list(
-                  path: '$empId',
-                  searchOptions: const SearchOptions(limit: 1),
-                );
-
-            if (files.isNotEmpty) {
-              photoUrl = _client.storage
-                  .from('employee-photos')
-                  .getPublicUrl('$empId/${files.first.name}');
-            }
-          } catch (e) {
-            debugPrint('Could not fetch photo for employee $empId: $e');
-          }
-        }
-
-        employees.add({
-          'id': empId,
-          'first_name': emp['first_name'] ?? '',
-          'last_name': emp['last_name'] ?? '',
-          'position': emp['position'] ?? '',
-          'photo_url': photoUrl,
-        });
-      }
-
-      return employees;
-    } catch (e) {
-      debugPrint('Error fetching employees with photos: $e');
-      return [];
-    }
+  List<Map<String, dynamic>> _mapLocalEmployees(
+    List<Map<String, dynamic>> localEmployees,
+  ) {
+    return localEmployees
+        .map(
+          (emp) => <String, dynamic>{
+            'id': emp['id'],
+            'first_name': emp['first_name'] ?? '',
+            'last_name': emp['last_name'] ?? '',
+            'position': emp['position'] ?? '',
+            'photo_url': emp['image_url'],
+          },
+        )
+        .toList();
   }
 
   /// Verifies a face embedding against ALL encodings of a specific employee.
@@ -938,20 +989,33 @@ class SupabaseService {
       }
     }
 
-    // Local verification didn't confirm. If online, fall back to RPC and trigger background sync if match found.
+    // Local verification didn't confirm. If online, fall back to a server-
+    // side match via the Next.js API (follows AppConfig.nextJsBaseUrl, so
+    // this checks whichever database the app is actually pointed at,
+    // instead of always querying production Supabase directly).
     if (await isOnline) {
       try {
-        final vectorStr = '[${normalizedEmbedding.join(',')}]';
-        final response = await _client.rpc(
-          'match_face',
-          params: {
-            'query_embedding': vectorStr,
+        final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/match-face');
+        final response = await http.post(
+          url,
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': AppConfig.mobileApiKey,
+          },
+          body: jsonEncode({
+            'query_embedding': normalizedEmbedding,
             'match_threshold': 0.6,
             'match_count': 5,
-          },
+          }),
         );
 
-        final List<dynamic> results = response;
+        if (response.statusCode != 200) {
+          throw Exception(
+            'Match face request failed: ${response.statusCode} ${response.body}',
+          );
+        }
+
+        final List<dynamic> results = jsonDecode(response.body);
         for (final match in results) {
           if (match['employee_id'] == employeeId) {
             // Refresh local cache in background

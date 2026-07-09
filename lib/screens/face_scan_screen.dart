@@ -29,6 +29,8 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
   String _statusMessage = "Loading...";
   bool _isConnected = true;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
+  SyncStatus? _syncStatus;
+  Timer? _syncStatusTimer;
 
   // Calendar state
   CalendarFormat _calendarFormat = CalendarFormat.month;
@@ -45,6 +47,19 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
     super.initState();
     _initConnectivity();
     _initialize();
+    _refreshSyncStatus();
+    // Outages can persist for a while on a device nobody is watching —
+    // poll periodically so pending/failed counts don't just reflect
+    // whatever happened to be true when the screen first loaded.
+    _syncStatusTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _refreshSyncStatus(),
+    );
+  }
+
+  Future<void> _refreshSyncStatus() async {
+    final status = await _supabaseService.getSyncStatus();
+    if (mounted) setState(() => _syncStatus = status);
   }
 
   void _initConnectivity() {
@@ -52,7 +67,19 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       results,
     ) {
       final isConnected = results.any((r) => r != ConnectivityResult.none);
+      final justReconnected = isConnected && !_isConnected;
       if (mounted) setState(() => _isConnected = isConnected);
+
+      // The actual reconnect-triggered sync lives in
+      // SupabaseService.startBackgroundSync (service-level, so it fires
+      // regardless of which screen is active). Duplicating that call here
+      // would race it — whichever listener loses the race would see the
+      // other's already-applied change as a server-side conflict and
+      // wrongly log it as a failed sync. Just refresh the badge shortly
+      // after so it reflects the sync that's already happening.
+      if (justReconnected) {
+        Future.delayed(const Duration(seconds: 3), _refreshSyncStatus);
+      }
     });
   }
 
@@ -252,17 +279,19 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
       // Face matched! Record attendance + improve dataset
       final similarity = matchResult['similarity'];
 
-      // Improve Dataset (Fire & Forget)
-      if (_isConnected) {
-        _supabaseService
-            .saveFaceDescriptor(employeeId, embedding)
-            .then((_) {
-              debugPrint("Dataset improved for employee $employeeId");
-            })
-            .catchError((e) {
-              debugPrint("Failed to improve dataset (non-fatal): $e");
-            });
-      }
+      // Improve Dataset (Fire & Forget). saveFaceDescriptor already falls
+      // back to the offline queue internally when there's no connection —
+      // gating this call on _isConnected would just skip queuing it and
+      // lose the improvement entirely, rather than syncing it once back
+      // online.
+      _supabaseService
+          .saveFaceDescriptor(employeeId, embedding)
+          .then((_) {
+            debugPrint("Dataset improved for employee $employeeId");
+          })
+          .catchError((e) {
+            debugPrint("Failed to improve dataset (non-fatal): $e");
+          });
 
       // Record Attendance
       await _supabaseService.recordAttendance(employeeId, type);
@@ -379,12 +408,14 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
           _statusMessage = "Ready";
         });
       }
+      _refreshSyncStatus();
     }
   }
 
   @override
   void dispose() {
     _connectivitySubscription?.cancel();
+    _syncStatusTimer?.cancel();
     super.dispose();
   }
 
@@ -516,6 +547,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
               ],
             ),
           ),
+          if (_syncStatus?.hasIssues == true) _buildSyncStatusBadge(),
           IconButton(
             icon: const Icon(Icons.admin_panel_settings),
             onPressed: _showAdminLoginDialog,
@@ -902,6 +934,112 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
           fontWeight: FontWeight.bold,
           letterSpacing: 1.0,
         ),
+      ),
+    );
+  }
+
+  /// Badge showing unsynced/failed record counts, so an outage on this
+  /// device isn't invisible until the server's 7-day sync window expires
+  /// and records start silently disappearing. Red (failed) takes priority
+  /// over amber (still pending, will keep retrying).
+  Widget _buildSyncStatusBadge() {
+    final status = _syncStatus!;
+    final hasFailed = status.failedCount > 0;
+    final color = hasFailed ? Colors.red : Colors.orange;
+    final label = hasFailed
+        ? '${status.failedCount} sync issue${status.failedCount == 1 ? '' : 's'}'
+        : '${status.pendingCount} pending';
+
+    return Padding(
+      padding: const EdgeInsets.only(right: 4),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => _showSyncStatusDialog(status),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.1),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: color, width: 1),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                hasFailed ? Icons.error_outline : Icons.cloud_upload_outlined,
+                color: color,
+                size: 16,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  color: color,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showSyncStatusDialog(SyncStatus status) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Sync Status'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (status.pendingCount > 0)
+                  Text(
+                    '${status.pendingCount} record(s) waiting to sync — '
+                    'will retry automatically once online.',
+                  ),
+                if (status.failedCount > 0) ...[
+                  if (status.pendingCount > 0) const SizedBox(height: 12),
+                  const Text(
+                    'These could not be synced and were not recorded on '
+                    'the server:',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  for (final log in status.failedLogs)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        '• Attendance (employee ${log['employee_id']}, '
+                        '${log['type']}, ${log['timestamp']}): '
+                        '${log['sync_error']}',
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                  for (final enc in status.failedEncodings)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        '• Face data (employee ${enc['employee_id']}): '
+                        '${enc['sync_error']}',
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
       ),
     );
   }

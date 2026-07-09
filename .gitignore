@@ -43,3 +43,12 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Build-time secrets (see env.example.json)
+env.json
+env.production.json
+env.*.json
+!env.example.json
+
+# Gradle build output (distinct from Flutter's root /build/)
+/android/build/

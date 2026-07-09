@@ -1,10 +1,16 @@
+import 'dart:math';
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
 /// Phases of the active liveness challenge.
-enum LivenessPhase { positionFace, blink, colorChallenge, passed, failed }
+enum LivenessPhase { positionFace, gesture, colorChallenge, passed, failed }
+
+/// The randomized action asked of the user during [LivenessPhase.gesture].
+/// A fresh gesture is drawn per attempt so a replayed video of a single
+/// past gesture can't be pre-recorded and reused for the next check-in.
+enum LivenessGesture { blink, smile, turnLeft, turnRight }
 
 /// Colors cycled during the color-challenge phase.
 /// We use 3 distinct hues so brightness-shift analysis is meaningful.
@@ -19,13 +25,29 @@ const List<Color> challengeColors = [
 /// Feed it ML Kit [Face] results frame-by-frame via [update] and it will
 /// advance through [LivenessPhase]s automatically.
 class LivenessService {
+  LivenessService({Random? random}) : _rng = random ?? Random();
+
+  final Random _rng;
+
   LivenessPhase _phase = LivenessPhase.positionFace;
   LivenessPhase get phase => _phase;
 
   // ── Position-face ──────────────────────────────────────────────
   Rect? ovalRect; // Set by the UI once layout is known.
 
-  // ── Blink detection ────────────────────────────────────────────
+  // ── Gesture selection ──────────────────────────────────────────
+  LivenessGesture? _currentGesture;
+  LivenessGesture? get currentGesture => _currentGesture;
+  final List<LivenessGesture> _remainingGestures = [];
+  DateTime? _gestureStartedAt;
+
+  // If the current gesture hasn't completed in this long, assume it's not
+  // working for this face/lighting/device (e.g. a device that never reports
+  // a smilingProbability) and swap to a different randomly-chosen gesture
+  // rather than stalling the whole check.
+  static const Duration _perGestureTimeout = Duration(seconds: 8);
+
+  // ── Blink sub-state ────────────────────────────────────────────
   int _eyesClosedFrames = 0;
   int _eyesOpenAfterCloseFrames = 0;
   bool _sawEyesClosed = false;
@@ -34,19 +56,39 @@ class LivenessService {
   static const double _closedThreshold = 0.45;
   static const double _openThreshold = 0.55;
 
-  // ── Color challenge ────────────────────────────────────────────
+  // ── Smile sub-state ────────────────────────────────────────────
+  // Requires a neutral→smile transition (not just "is smiling") so a photo
+  // of an already-smiling face doesn't trivially pass.
+  int _neutralFrames = 0;
+  int _smileFrames = 0;
+  bool _sawNeutral = false;
+  static const int _requiredNeutralFrames = 1;
+  static const int _requiredSmileFrames = 1;
+  static const double _neutralSmileThreshold = 0.4;
+  static const double _smileThreshold = 0.75;
+
+  // ── Head-turn sub-state ────────────────────────────────────────
+  // Requires turn-away-then-return-to-center, so a photo held at a fixed
+  // angle doesn't satisfy it — only an actual turning motion does.
+  int _turnedFrames = 0;
+  int _returnedFrames = 0;
+  bool _sawTurned = false;
+  double? _lastHeadEulerAngleY;
+  static const int _requiredTurnedFrames = 1;
+  static const int _requiredReturnedFrames = 1;
+  // Confirmed on a real device: positive headEulerAngleY = turned toward
+  // the viewer's left (opposite of the usual ML Kit Flutter sample
+  // convention — front camera mirroring varies by device/OEM camera stack).
+  static const double _turnThreshold = 15.0;
+  static const double _centerThreshold = 8.0;
+
+  // ── Color challenge (currently unused, see below) ──────────────
   int _currentColorIndex = 0;
   int get currentColorIndex => _currentColorIndex;
   Color get currentChallengeColor => challengeColors[_currentColorIndex];
-
-  /// Average face-region brightness captured per color.
   final List<double> _brightnessSamples = [];
   int _colorHoldFrames = 0;
-
-  /// How many frames to hold each color before sampling.
   static const int _colorHoldRequired = 3;
-
-  /// Minimum brightness variance across 3 colors to be considered "live".
   static const double _varianceThreshold = 1.5;
 
   // ── Instruction text for the UI ────────────────────────────────
@@ -54,8 +96,8 @@ class LivenessService {
     switch (_phase) {
       case LivenessPhase.positionFace:
         return 'Position your face inside the oval';
-      case LivenessPhase.blink:
-        return 'Please blink';
+      case LivenessPhase.gesture:
+        return _gestureInstruction;
       case LivenessPhase.colorChallenge:
         return 'Hold still…';
       case LivenessPhase.passed:
@@ -65,15 +107,71 @@ class LivenessService {
     }
   }
 
+  String get _gestureInstruction {
+    switch (_currentGesture) {
+      case LivenessGesture.blink:
+        return 'Please blink';
+      case LivenessGesture.smile:
+        return 'Please smile';
+      case LivenessGesture.turnLeft:
+        return _turnInstruction(turnLeft: true);
+      case LivenessGesture.turnRight:
+        return _turnInstruction(turnLeft: false);
+      case null:
+        return 'Get ready…';
+    }
+  }
+
+  String _turnInstruction({required bool turnLeft}) {
+    if (_sawTurned) return 'Great! Now return to center';
+
+    final angle = _lastHeadEulerAngleY;
+    final label = turnLeft ? 'left' : 'right';
+    final facingWrongWay = angle == null || (turnLeft ? angle <= 0 : angle >= 0);
+    if (facingWrongWay) return 'Turn your head $label';
+    if (turnProgress < 0.5) return 'Keep turning $label...';
+    return 'Almost there — a bit more $label';
+  }
+
+  /// How close the live head-turn angle is to satisfying the active turn
+  /// gesture's threshold: 0.0 (facing the wrong way) to 1.0 (aligned).
+  /// Only meaningful while [currentGesture] is turnLeft/turnRight — used to
+  /// drive live "almost there" text and the directional arrow's glow.
+  double get turnProgress {
+    final angle = _lastHeadEulerAngleY;
+    if (angle == null) return 0.0;
+    if (_currentGesture == LivenessGesture.turnLeft) {
+      return (angle / _turnThreshold).clamp(0.0, 1.0);
+    }
+    if (_currentGesture == LivenessGesture.turnRight) {
+      return (-angle / _turnThreshold).clamp(0.0, 1.0);
+    }
+    return 0.0;
+  }
+
   /// Reset everything for a new attempt.
   void reset() {
     _phase = LivenessPhase.positionFace;
-    _eyesClosedFrames = 0;
-    _eyesOpenAfterCloseFrames = 0;
-    _sawEyesClosed = false;
+    _currentGesture = null;
+    _remainingGestures.clear();
+    _gestureStartedAt = null;
+    _resetGestureSubState();
     _currentColorIndex = 0;
     _brightnessSamples.clear();
     _colorHoldFrames = 0;
+  }
+
+  void _resetGestureSubState() {
+    _eyesClosedFrames = 0;
+    _eyesOpenAfterCloseFrames = 0;
+    _sawEyesClosed = false;
+    _neutralFrames = 0;
+    _smileFrames = 0;
+    _sawNeutral = false;
+    _turnedFrames = 0;
+    _returnedFrames = 0;
+    _sawTurned = false;
+    _lastHeadEulerAngleY = null;
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -84,21 +182,85 @@ class LivenessService {
   /// [faceBrightness] — average brightness of the face bounding-box region,
   ///                    computed by the caller from the camera image.
   LivenessPhase update({Face? face, double? faceBrightness}) {
+    return _updateInternal(
+      faceWidth: face?.boundingBox.width,
+      faceHeight: face?.boundingBox.height,
+      leftEyeOpen: face?.leftEyeOpenProbability,
+      rightEyeOpen: face?.rightEyeOpenProbability,
+      smiling: face?.smilingProbability,
+      headEulerAngleY: face?.headEulerAngleY,
+      faceBrightness: faceBrightness,
+    );
+  }
+
+  /// Same as [update] but takes raw values instead of a [Face], so the
+  /// state machine can be exercised in tests without constructing ML Kit
+  /// types.
+  @visibleForTesting
+  LivenessPhase updateForTest({
+    double? faceWidth,
+    double? faceHeight,
+    double? leftEyeOpen,
+    double? rightEyeOpen,
+    double? smiling,
+    double? headEulerAngleY,
+    double? faceBrightness,
+  }) {
+    return _updateInternal(
+      faceWidth: faceWidth,
+      faceHeight: faceHeight,
+      leftEyeOpen: leftEyeOpen,
+      rightEyeOpen: rightEyeOpen,
+      smiling: smiling,
+      headEulerAngleY: headEulerAngleY,
+      faceBrightness: faceBrightness,
+    );
+  }
+
+  /// Test-only: force the gesture timeout clock into the past so a
+  /// timeout-driven gesture swap can be exercised deterministically.
+  @visibleForTesting
+  void debugSetGestureStartedAt(DateTime time) {
+    _gestureStartedAt = time;
+  }
+
+  /// Test-only: advance to the next queued gesture without waiting for a
+  /// timeout, so tests can force a specific gesture to be active.
+  @visibleForTesting
+  void debugSkipToNextGesture() => _startNextGesture();
+
+  @visibleForTesting
+  DateTime? get debugGestureStartedAt => _gestureStartedAt;
+
+  LivenessPhase _updateInternal({
+    double? faceWidth,
+    double? faceHeight,
+    double? leftEyeOpen,
+    double? rightEyeOpen,
+    double? smiling,
+    double? headEulerAngleY,
+    double? faceBrightness,
+  }) {
     if (_phase == LivenessPhase.passed || _phase == LivenessPhase.failed) {
       return _phase;
     }
 
     // No face → stay in current phase but don't advance.
-    if (face == null) return _phase;
+    if (faceWidth == null || faceHeight == null) return _phase;
 
     switch (_phase) {
       case LivenessPhase.positionFace:
-        _handlePositionFace(face);
+        _handlePositionFace(faceWidth, faceHeight);
         break;
-      case LivenessPhase.blink:
-        _handleBlink(face);
+      case LivenessPhase.gesture:
+        _handleGesture(
+          leftEyeOpen: leftEyeOpen,
+          rightEyeOpen: rightEyeOpen,
+          smiling: smiling,
+          headEulerAngleY: headEulerAngleY,
+        );
         break;
-      // Color challenge is currently skipped — blink goes straight to passed.
+      // Color challenge is currently skipped — gestures go straight to passed.
       // The color challenge measures brightness variance across flashed colors,
       // but in practice ambient lighting dominates and the variance is
       // unreliable for distinguishing real faces from photos/screens.
@@ -115,23 +277,63 @@ class LivenessService {
 
   // ─────────────── Phase handlers ───────────────
 
-  void _handlePositionFace(Face face) {
+  void _handlePositionFace(double faceWidth, double faceHeight) {
     // Face bounding box is in ML Kit image coordinates, which don't map
     // directly to screen coordinates.  As long as a face is detected
     // and has a reasonable size we accept it.
-    final faceBox = face.boundingBox;
-    if (faceBox.width > 50 && faceBox.height > 50) {
-      _phase = LivenessPhase.blink;
+    if (faceWidth > 50 && faceHeight > 50) {
+      _phase = LivenessPhase.gesture;
+      _startNextGesture();
       debugPrint(
-        '[Liveness] Face positioned (${faceBox.width.toInt()}x${faceBox.height.toInt()}) — moving to blink phase',
+        '[Liveness] Face positioned (${faceWidth.toInt()}x${faceHeight.toInt()})'
+        ' — starting gesture: $_currentGesture',
       );
     }
   }
 
-  void _handleBlink(Face face) {
-    final leftEye = face.leftEyeOpenProbability;
-    final rightEye = face.rightEyeOpenProbability;
+  void _startNextGesture() {
+    if (_remainingGestures.isEmpty) {
+      _remainingGestures.addAll(LivenessGesture.values);
+      _remainingGestures.shuffle(_rng);
+    }
+    _currentGesture = _remainingGestures.removeLast();
+    _gestureStartedAt = DateTime.now();
+    _resetGestureSubState();
+  }
 
+  void _handleGesture({
+    double? leftEyeOpen,
+    double? rightEyeOpen,
+    double? smiling,
+    double? headEulerAngleY,
+  }) {
+    final startedAt = _gestureStartedAt;
+    if (startedAt != null &&
+        DateTime.now().difference(startedAt) > _perGestureTimeout) {
+      debugPrint(
+        '[Liveness] "$_currentGesture" timed out — trying a different gesture',
+      );
+      _startNextGesture();
+      return;
+    }
+
+    switch (_currentGesture!) {
+      case LivenessGesture.blink:
+        _handleBlink(leftEyeOpen, rightEyeOpen);
+        break;
+      case LivenessGesture.smile:
+        _handleSmile(smiling);
+        break;
+      case LivenessGesture.turnLeft:
+        _handleTurn(headEulerAngleY, turnLeft: true);
+        break;
+      case LivenessGesture.turnRight:
+        _handleTurn(headEulerAngleY, turnLeft: false);
+        break;
+    }
+  }
+
+  void _handleBlink(double? leftEye, double? rightEye) {
     debugPrint(
       '[Liveness] Eyes: L=${leftEye?.toStringAsFixed(2)} R=${rightEye?.toStringAsFixed(2)} closed=$_sawEyesClosed',
     );
@@ -161,6 +363,71 @@ class LivenessService {
         }
       } else {
         _eyesOpenAfterCloseFrames = 0;
+      }
+    }
+  }
+
+  void _handleSmile(double? smiling) {
+    debugPrint(
+      '[Liveness] Smile: ${smiling?.toStringAsFixed(2)} sawNeutral=$_sawNeutral',
+    );
+
+    if (smiling == null) return;
+
+    if (!_sawNeutral) {
+      if (smiling < _neutralSmileThreshold) {
+        _neutralFrames++;
+        if (_neutralFrames >= _requiredNeutralFrames) {
+          _sawNeutral = true;
+          debugPrint('[Liveness] Neutral expression detected');
+        }
+      } else {
+        _neutralFrames = 0;
+      }
+    } else {
+      if (smiling > _smileThreshold) {
+        _smileFrames++;
+        if (_smileFrames >= _requiredSmileFrames) {
+          debugPrint('[Liveness] Smile confirmed — liveness passed');
+          _phase = LivenessPhase.passed;
+        }
+      } else {
+        _smileFrames = 0;
+      }
+    }
+  }
+
+  void _handleTurn(double? headEulerAngleY, {required bool turnLeft}) {
+    debugPrint(
+      '[Liveness] HeadY: ${headEulerAngleY?.toStringAsFixed(1)} turnLeft=$turnLeft sawTurned=$_sawTurned',
+    );
+
+    if (headEulerAngleY == null) return;
+    _lastHeadEulerAngleY = headEulerAngleY;
+
+    final isTurnedCorrectDirection = turnLeft
+        ? headEulerAngleY > _turnThreshold
+        : headEulerAngleY < -_turnThreshold;
+
+    if (!_sawTurned) {
+      if (isTurnedCorrectDirection) {
+        _turnedFrames++;
+        if (_turnedFrames >= _requiredTurnedFrames) {
+          _sawTurned = true;
+          debugPrint('[Liveness] Head turn detected (angle=$headEulerAngleY)');
+        }
+      } else {
+        _turnedFrames = 0;
+      }
+    } else {
+      if (headEulerAngleY.abs() < _centerThreshold) {
+        _returnedFrames++;
+        if (_returnedFrames >= _requiredReturnedFrames) {
+          debugPrint('[Liveness] Head returned to center — liveness passed');
+          _phase = LivenessPhase.passed;
+        }
+      } else {
+        _returnedFrames = 0;
       }
     }
   }

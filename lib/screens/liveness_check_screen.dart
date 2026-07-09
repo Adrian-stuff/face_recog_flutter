@@ -46,6 +46,30 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
 
   static const Duration _timeout = Duration(seconds: 30);
 
+  // Consecutive missed-face frames before showing "No face detected" —
+  // avoids the message flickering on/off during normal single-frame
+  // detection misses (motion blur, brief occlusion).
+  static const int _noFaceFrameThreshold = 6;
+  int _noFaceFrames = 0;
+
+  /// Icon shown alongside the instruction text and as a pulsing overlay
+  /// near the face oval, so the current gesture reads at a glance instead
+  /// of requiring the user to parse a sentence mid-motion.
+  IconData? _iconFor(LivenessGesture? gesture) {
+    switch (gesture) {
+      case LivenessGesture.blink:
+        return Icons.visibility;
+      case LivenessGesture.smile:
+        return Icons.sentiment_satisfied_alt;
+      case LivenessGesture.turnLeft:
+        return Icons.chevron_left;
+      case LivenessGesture.turnRight:
+        return Icons.chevron_right;
+      case null:
+        return null;
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -136,16 +160,26 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
         Face? face;
 
         if (error != null) {
-          // Show user-facing message for multiple faces.
-          if (mounted) {
-            setState(() {
-              _errorMessage = error == 'Multiple faces detected'
-                  ? 'Only one face allowed'
-                  : null;
-            });
+          if (error == 'Multiple faces detected') {
+            _noFaceFrames = 0;
+            if (mounted) {
+              setState(() => _errorMessage = 'Only one face allowed');
+            }
+          } else if (error == 'No face detected') {
+            _noFaceFrames++;
+            if (_noFaceFrames >= _noFaceFrameThreshold && mounted) {
+              setState(
+                () => _errorMessage =
+                    'No face detected — center your face in the oval',
+              );
+            }
           }
+          // Other errors (invalid frame, transient detection failure) are
+          // expected to self-resolve next frame — don't flash noise at the
+          // user for a single bad frame.
         } else {
           face = result['face'] as Face?;
+          _noFaceFrames = 0;
           if (mounted) {
             _leftEyeProb = result['leftEyeOpen'] as double?;
             _rightEyeProb = result['rightEyeOpen'] as double?;
@@ -252,7 +286,7 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
       case LivenessPhase.positionFace:
         borderColor = Colors.white;
         break;
-      case LivenessPhase.blink:
+      case LivenessPhase.gesture:
         borderColor = Colors.amber;
         break;
       case LivenessPhase.colorChallenge:
@@ -271,6 +305,12 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
     if (phase == LivenessPhase.colorChallenge) {
       challengeColor = _liveness.currentChallengeColor;
     }
+
+    final gesture = _liveness.currentGesture;
+    final gestureIcon = phase == LivenessPhase.gesture
+        ? _iconFor(gesture)
+        : null;
+    final ovalRect = _liveness.ovalRect;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -295,6 +335,20 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
               );
             },
           ),
+
+          // Gesture overlay — arrows beside the oval for turn left/right,
+          // an icon above the oval for blink/smile. Turn arrows glow brighter
+          // as the user turns closer to the target angle (live feedback);
+          // blink/smile just pulse in sync with the oval border.
+          if (gestureIcon != null && ovalRect != null && _errorMessage == null)
+            _GestureOverlayIcon(
+              gesture: gesture,
+              icon: gestureIcon,
+              ovalRect: ovalRect,
+              color: borderColor,
+              pulse: _pulseAnimation,
+              turnProgress: _liveness.turnProgress,
+            ),
 
           // Instruction / error text.
           Positioned(
@@ -322,17 +376,28 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
                         width: 1,
                       ),
                     ),
-                    child: Text(
-                      _errorMessage ?? _liveness.instruction,
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: _errorMessage != null
-                            ? Colors.redAccent
-                            : Colors.white,
-                        fontSize: 20,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.3,
-                      ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (gestureIcon != null && _errorMessage == null) ...[
+                          Icon(gestureIcon, color: Colors.white, size: 22),
+                          const SizedBox(width: 8),
+                        ],
+                        Flexible(
+                          child: Text(
+                            _errorMessage ?? _liveness.instruction,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: _errorMessage != null
+                                  ? Colors.redAccent
+                                  : Colors.white,
+                              fontSize: 20,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: 0.3,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -385,6 +450,92 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
     _restoreBrightness();
     WakelockPlus.disable(); // Allow screen to sleep again
     super.dispose();
+  }
+}
+
+/// Pulsing icon positioned relative to the face oval: arrows beside it for
+/// turn left/right, an icon above it for blink/smile (inside the oval would
+/// cover the face the user is trying to look at).
+class _GestureOverlayIcon extends StatelessWidget {
+  const _GestureOverlayIcon({
+    required this.gesture,
+    required this.icon,
+    required this.ovalRect,
+    required this.color,
+    required this.pulse,
+    required this.turnProgress,
+  });
+
+  final LivenessGesture? gesture;
+  final IconData icon;
+  final Rect ovalRect;
+  final Color color;
+  final Animation<double> pulse;
+
+  /// 0.0-1.0 progress toward the target turn angle. Only meaningful for
+  /// turnLeft/turnRight — ignored (falls back to [pulse]) for blink/smile.
+  final double turnProgress;
+
+  static const double _size = 56;
+
+  bool get _isTurnGesture =>
+      gesture == LivenessGesture.turnLeft || gesture == LivenessGesture.turnRight;
+
+  @override
+  Widget build(BuildContext context) {
+    double left;
+    double top;
+    switch (gesture) {
+      case LivenessGesture.turnLeft:
+        left = ovalRect.left - _size - 12;
+        top = ovalRect.center.dy - _size / 2;
+        break;
+      case LivenessGesture.turnRight:
+        left = ovalRect.right + 12;
+        top = ovalRect.center.dy - _size / 2;
+        break;
+      case LivenessGesture.blink:
+      case LivenessGesture.smile:
+      case null:
+        left = ovalRect.center.dx - _size / 2;
+        top = ovalRect.top - _size - 16;
+        break;
+    }
+
+    if (_isTurnGesture) {
+      final glowColor = Color.lerp(Colors.white, Colors.greenAccent, turnProgress)!;
+      return Positioned(
+        left: left,
+        top: top,
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 150),
+          opacity: 0.35 + (turnProgress * 0.65),
+          child: AnimatedScale(
+            duration: const Duration(milliseconds: 150),
+            scale: 0.8 + (turnProgress * 0.3),
+            child: Icon(
+              icon,
+              size: _size,
+              color: glowColor,
+              shadows: turnProgress > 0.8
+                  ? [Shadow(color: glowColor, blurRadius: 16)]
+                  : null,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Positioned(
+      left: left,
+      top: top,
+      child: AnimatedBuilder(
+        animation: pulse,
+        builder: (context, child) =>
+            Opacity(opacity: pulse.value, child: child),
+        child: Icon(icon, size: _size, color: color),
+      ),
+    );
   }
 }
 

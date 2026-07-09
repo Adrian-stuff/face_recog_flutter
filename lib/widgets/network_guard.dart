@@ -23,6 +23,8 @@ class _NetworkGuardState extends State<NetworkGuard>
   bool _isAllowed = false;
   bool _isLoading = true;
   String? _currentSSID;
+  String? _currentBSSID;
+  String? _locationFailureReason;
 
   StreamSubscription? _subscription;
 
@@ -56,30 +58,70 @@ class _NetworkGuardState extends State<NetworkGuard>
     if (!mounted) return;
 
     setState(() => _isLoading = true);
+    _locationFailureReason = null;
 
     String? ssid = await _networkService.getCurrentSSID();
     String requiredSSID = await _settingsService.getWifiSSID();
+    String? bssid = await _networkService.getCurrentBSSID();
+    String requiredBSSID = await _settingsService.getWifiBSSID();
 
     if (!mounted) return;
 
+    bool wifiOk = false;
     if (ssid != null) {
       String cleanedSSID = _networkService.cleanSSID(ssid);
       _currentSSID = cleanedSSID;
+      _currentBSSID = bssid ?? 'Unavailable on this device';
 
-      // Check if it matches config
-      if (cleanedSSID == requiredSSID) {
-        setState(() {
-          _isAllowed = true;
-          _isLoading = false;
-        });
-        return;
-      }
+      // SSID must always match. BSSID is an additional check that only
+      // applies once an admin has configured one (an empty requiredBSSID
+      // means "not enforced" — SSIDs are spoofable, but requiring a BSSID
+      // match before one is on file would lock everyone out).
+      final bssidOk = requiredBSSID.isEmpty || bssid == requiredBSSID;
+      wifiOk = cleanedSSID == requiredSSID && bssidOk;
     } else {
       _currentSSID = 'Unknown / Not Connected';
+      _currentBSSID = null;
     }
 
+    if (!wifiOk) {
+      setState(() {
+        _isAllowed = false;
+        _isLoading = false;
+      });
+      return;
+    }
+
+    // GPS geofence is a second, independent signal on top of WiFi — only
+    // enforced once an admin has captured office coordinates.
+    final geofence = await _settingsService.getGeofence();
+    if (geofence != null) {
+      final geo = await _networkService.getCurrentGeoReading();
+      if (geo == null) {
+        _locationFailureReason = 'Unable to verify device location';
+        wifiOk = false;
+      } else if (geo.isMocked) {
+        _locationFailureReason = 'Mock/fake location detected on this device';
+        wifiOk = false;
+      } else {
+        final distance = _networkService.distanceMeters(
+          geo.latitude,
+          geo.longitude,
+          geofence.latitude,
+          geofence.longitude,
+        );
+        if (distance > geofence.radiusMeters) {
+          _locationFailureReason =
+              'Outside office location (${distance.round()}m away, '
+              'allowed ${geofence.radiusMeters.round()}m)';
+          wifiOk = false;
+        }
+      }
+    }
+
+    if (!mounted) return;
     setState(() {
-      _isAllowed = false;
+      _isAllowed = wifiOk;
       _isLoading = false;
     });
   }
@@ -115,16 +157,28 @@ class _NetworkGuardState extends State<NetworkGuard>
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Icon(Icons.wifi_off, size: 64, color: Colors.red),
+              Icon(
+                _locationFailureReason != null
+                    ? Icons.location_off
+                    : Icons.wifi_off,
+                size: 64,
+                color: Colors.red,
+              ),
               const SizedBox(height: 24),
-              const Text(
-                'Incorrect WiFi Network',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+              Text(
+                _locationFailureReason != null
+                    ? 'Location Check Failed'
+                    : 'Incorrect WiFi Network',
+                style: const TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                ),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
-              const Text(
-                'This app can only be used when connected to the office WiFi.',
+              Text(
+                _locationFailureReason ??
+                    'This app can only be used when connected to the office WiFi.',
                 textAlign: TextAlign.center,
               ),
 
@@ -136,6 +190,13 @@ class _NetworkGuardState extends State<NetworkGuard>
                   color: Colors.red,
                 ),
               ),
+              if (_currentBSSID != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  'Access point: $_currentBSSID',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ],
               const SizedBox(height: 32),
               ElevatedButton(
                 onPressed: _checkNetwork,

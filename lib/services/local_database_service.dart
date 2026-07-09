@@ -29,7 +29,7 @@ class LocalDatabaseService {
 
     return await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE employees (
@@ -49,7 +49,8 @@ class LocalDatabaseService {
             employee_id INTEGER,
             timestamp TEXT,
             type TEXT,
-            is_synced INTEGER DEFAULT 0
+            is_synced INTEGER DEFAULT 0,
+            sync_error TEXT
           )
         ''');
 
@@ -60,7 +61,8 @@ class LocalDatabaseService {
             descriptor TEXT,
             is_golden INTEGER DEFAULT 0,
             created_at TEXT,
-            is_synced INTEGER DEFAULT 0
+            is_synced INTEGER DEFAULT 0,
+            sync_error TEXT
           )
         ''');
       },
@@ -81,6 +83,19 @@ class LocalDatabaseService {
         if (oldVersion < 3) {
           await db.execute(
             'ALTER TABLE employees ADD COLUMN local_image_path TEXT',
+          );
+        }
+        if (oldVersion < 4) {
+          // Previously, a sync attempt that permanently failed (e.g. server
+          // rejected an offline log as too old) was marked is_synced=1 to
+          // stop retrying — indistinguishable from a real success, so the
+          // failure was invisible. sync_error now records why, so failures
+          // stay visible instead of silently vanishing from the queue.
+          await db.execute(
+            'ALTER TABLE attendance_logs ADD COLUMN sync_error TEXT',
+          );
+          await db.execute(
+            'ALTER TABLE offline_encodings ADD COLUMN sync_error TEXT',
           );
         }
       },
@@ -121,8 +136,14 @@ class LocalDatabaseService {
   Future<void> syncEmployees(List<Map<String, dynamic>> employees) async {
     final db = await database;
 
-    // Clear cache before syncing
+    // Clear cache before syncing. _cacheInitialized must be reset too —
+    // _initializeVectorCache() is a "run once" guard, so without this the
+    // rebuild below silently no-ops on every sync after the first one,
+    // leaving the cache permanently empty for newly-synced employees (e.g.
+    // one just registered) and pushing verification onto the online RPC
+    // fallback, which only knows about production data.
     _vectorCache.clear();
+    _cacheInitialized = false;
 
     await db.transaction((txn) async {
       await txn.delete('employees');
@@ -351,12 +372,47 @@ class LocalDatabaseService {
       for (var id in logIds) {
         await txn.update(
           'attendance_logs',
-          {'is_synced': 1},
+          {'is_synced': 1, 'sync_error': null},
           where: 'id = ?',
           whereArgs: [id],
         );
       }
     });
+  }
+
+  /// Stops retrying a log the server has permanently rejected (e.g. too old
+  /// to sync, or a genuine conflict) — but unlike [markLogsAsSynced], keeps
+  /// [reason] on the row so the failure stays visible instead of looking
+  /// identical to a real success.
+  Future<void> markLogsAsFailed(List<int> logIds, String reason) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      for (var id in logIds) {
+        await txn.update(
+          'attendance_logs',
+          {'is_synced': 1, 'sync_error': reason},
+          where: 'id = ?',
+          whereArgs: [id],
+        );
+      }
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> getFailedLogs() async {
+    final db = await database;
+    return await db.query(
+      'attendance_logs',
+      where: 'sync_error IS NOT NULL',
+      orderBy: 'timestamp DESC',
+    );
+  }
+
+  Future<int> getPendingLogsCount() async {
+    final db = await database;
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) as count FROM attendance_logs WHERE is_synced = 0',
+    );
+    return Sqflite.firstIntValue(result) ?? 0;
   }
 
   // --- Offline Encodings Methods ---
@@ -392,11 +448,44 @@ class LocalDatabaseService {
       for (var id in ids) {
         await txn.update(
           'offline_encodings',
-          {'is_synced': 1},
+          {'is_synced': 1, 'sync_error': null},
           where: 'id = ?',
           whereArgs: [id],
         );
       }
     });
+  }
+
+  /// See [markLogsAsFailed] — same "stop retrying, keep the reason visible"
+  /// treatment for offline face encodings.
+  Future<void> markEncodingsAsFailed(List<int> ids, String reason) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      for (var id in ids) {
+        await txn.update(
+          'offline_encodings',
+          {'is_synced': 1, 'sync_error': reason},
+          where: 'id = ?',
+          whereArgs: [id],
+        );
+      }
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> getFailedEncodings() async {
+    final db = await database;
+    return await db.query(
+      'offline_encodings',
+      where: 'sync_error IS NOT NULL',
+      orderBy: 'created_at DESC',
+    );
+  }
+
+  Future<int> getPendingEncodingsCount() async {
+    final db = await database;
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) as count FROM offline_encodings WHERE is_synced = 0',
+    );
+    return Sqflite.firstIntValue(result) ?? 0;
   }
 }
