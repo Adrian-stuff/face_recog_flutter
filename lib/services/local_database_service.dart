@@ -29,7 +29,7 @@ class LocalDatabaseService {
 
     return await openDatabase(
       path,
-      version: 4,
+      version: 5,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE employees (
@@ -50,7 +50,12 @@ class LocalDatabaseService {
             timestamp TEXT,
             type TEXT,
             is_synced INTEGER DEFAULT 0,
-            sync_error TEXT
+            sync_error TEXT,
+            lat REAL,
+            lng REAL,
+            is_mocked INTEGER,
+            wifi_ssid TEXT,
+            wifi_bssid TEXT
           )
         ''');
 
@@ -96,6 +101,25 @@ class LocalDatabaseService {
           );
           await db.execute(
             'ALTER TABLE offline_encodings ADD COLUMN sync_error TEXT',
+          );
+        }
+        if (oldVersion < 5) {
+          // Server-side location enforcement (checkLocation()) never
+          // actually received these — the app read them (NetworkGuard,
+          // isMocked) but only used them to gate the UI locally. Persisting
+          // them per-log lets a later sync still report what was true at
+          // the moment of the action, not whatever the device's state is
+          // when it finally gets a connection.
+          await db.execute('ALTER TABLE attendance_logs ADD COLUMN lat REAL');
+          await db.execute('ALTER TABLE attendance_logs ADD COLUMN lng REAL');
+          await db.execute(
+            'ALTER TABLE attendance_logs ADD COLUMN is_mocked INTEGER',
+          );
+          await db.execute(
+            'ALTER TABLE attendance_logs ADD COLUMN wifi_ssid TEXT',
+          );
+          await db.execute(
+            'ALTER TABLE attendance_logs ADD COLUMN wifi_bssid TEXT',
           );
         }
       },
@@ -330,6 +354,11 @@ class LocalDatabaseService {
     String type,
     DateTime timestamp, {
     bool isSynced = false,
+    double? lat,
+    double? lng,
+    bool? isMocked,
+    String? wifiSsid,
+    String? wifiBssid,
   }) async {
     if (await hasLogForToday(employeeId, type)) {
       throw Exception("Already recorded on this device today ($type)");
@@ -341,6 +370,11 @@ class LocalDatabaseService {
       'type': type,
       'timestamp': timestamp.toIso8601String(),
       'is_synced': isSynced ? 1 : 0,
+      'lat': lat,
+      'lng': lng,
+      'is_mocked': isMocked == null ? null : (isMocked ? 1 : 0),
+      'wifi_ssid': wifiSsid,
+      'wifi_bssid': wifiBssid,
     });
     debugPrint(
       '${isSynced ? "Online" : "Offline"} log saved for Employee $employeeId ($type)',
@@ -350,9 +384,24 @@ class LocalDatabaseService {
   Future<void> insertOfflineLog(
     int employeeId,
     String type,
-    DateTime timestamp,
-  ) async {
-    await insertLog(employeeId, type, timestamp, isSynced: false);
+    DateTime timestamp, {
+    double? lat,
+    double? lng,
+    bool? isMocked,
+    String? wifiSsid,
+    String? wifiBssid,
+  }) async {
+    await insertLog(
+      employeeId,
+      type,
+      timestamp,
+      isSynced: false,
+      lat: lat,
+      lng: lng,
+      isMocked: isMocked,
+      wifiSsid: wifiSsid,
+      wifiBssid: wifiBssid,
+    );
   }
 
   // --- Synchronization Methods (Up: Local -> Supabase) ---
@@ -413,6 +462,23 @@ class LocalDatabaseService {
       'SELECT COUNT(*) as count FROM attendance_logs WHERE is_synced = 0',
     );
     return Sqflite.firstIntValue(result) ?? 0;
+  }
+
+  /// Dismisses one failed log (e.g. a duplicate "Already timed in" rejection)
+  /// from the sync issues list. The real attendance record already exists
+  /// server-side; this just removes the noisy local copy.
+  Future<void> clearFailedLog(int id) async {
+    final db = await database;
+    await db.delete(
+      'attendance_logs',
+      where: 'id = ? AND sync_error IS NOT NULL',
+      whereArgs: [id],
+    );
+  }
+
+  Future<void> clearFailedLogs() async {
+    final db = await database;
+    await db.delete('attendance_logs', where: 'sync_error IS NOT NULL');
   }
 
   // --- Offline Encodings Methods ---
@@ -479,6 +545,21 @@ class LocalDatabaseService {
       where: 'sync_error IS NOT NULL',
       orderBy: 'created_at DESC',
     );
+  }
+
+  /// See [clearFailedLog] — same dismissal for a failed face encoding.
+  Future<void> clearFailedEncoding(int id) async {
+    final db = await database;
+    await db.delete(
+      'offline_encodings',
+      where: 'id = ? AND sync_error IS NOT NULL',
+      whereArgs: [id],
+    );
+  }
+
+  Future<void> clearFailedEncodings() async {
+    final db = await database;
+    await db.delete('offline_encodings', where: 'sync_error IS NOT NULL');
   }
 
   Future<int> getPendingEncodingsCount() async {

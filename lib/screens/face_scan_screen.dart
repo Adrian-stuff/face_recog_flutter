@@ -4,6 +4,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:table_calendar/table_calendar.dart';
+import '../config/kiosk_config.generated.dart';
 import '../services/face_service.dart';
 import '../services/sound_service.dart';
 import '../services/supabase_service.dart';
@@ -169,7 +170,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
               Text("Please select an employee first"),
             ],
           ),
-          backgroundColor: Colors.orange.shade700,
+          backgroundColor: KioskColors.warning,
           behavior: SnackBarBehavior.floating,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(12),
@@ -201,7 +202,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text("Liveness check cancelled."),
-            backgroundColor: Colors.orange,
+            backgroundColor: KioskColors.warning,
           ),
         );
         setState(() {
@@ -220,7 +221,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text("Could not extract face. Try again."),
-              backgroundColor: Colors.red,
+              backgroundColor: KioskColors.error,
             ),
           );
         }
@@ -260,7 +261,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                   ),
                 ],
               ),
-              backgroundColor: Colors.red.shade700,
+              backgroundColor: KioskColors.error,
               duration: const Duration(seconds: 5),
               behavior: SnackBarBehavior.floating,
               shape: RoundedRectangleBorder(
@@ -321,13 +322,13 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                 Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
-                    color: Colors.green.shade50,
+                    color: KioskColors.success.withValues(alpha: 0.1),
                     shape: BoxShape.circle,
                   ),
                   child: Icon(
                     Icons.check_circle_rounded,
                     size: 56,
-                    color: Colors.green.shade600,
+                    color: KioskColors.success,
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -343,19 +344,19 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                   '$firstName $lastName',
                   style: TextStyle(
                     fontSize: 17,
-                    color: Colors.grey[700],
+                    color: KioskColors.muted,
                     fontWeight: FontWeight.w500,
                   ),
                 ),
                 const SizedBox(height: 4),
                 Text(
                   timeString,
-                  style: TextStyle(fontSize: 15, color: Colors.grey[500]),
+                  style: TextStyle(fontSize: 15, color: KioskColors.muted),
                 ),
                 const SizedBox(height: 4),
                 Text(
                   'Match: ${(similarity * 100).toStringAsFixed(1)}%',
-                  style: TextStyle(fontSize: 13, color: Colors.grey[400]),
+                  style: TextStyle(fontSize: 13, color: KioskColors.muted),
                 ),
               ],
             ),
@@ -365,7 +366,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                 child: ElevatedButton(
                   onPressed: () => Navigator.pop(ctx),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.green,
+                    backgroundColor: KioskColors.success,
                     foregroundColor: Colors.white,
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(12),
@@ -395,7 +396,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(errorMessage),
-            backgroundColor: Colors.red,
+            backgroundColor: KioskColors.error,
             behavior: SnackBarBehavior.floating,
             duration: const Duration(seconds: 4),
           ),
@@ -471,7 +472,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
                       content: Text("Invalid Credentials"),
-                      backgroundColor: Colors.red,
+                      backgroundColor: KioskColors.error,
                     ),
                   );
                 }
@@ -511,7 +512,12 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("Face Attendance"),
+        title: ValueListenableBuilder<String?>(
+          valueListenable: _supabaseService.companyName,
+          builder: (context, name, _) {
+            return Text(name != null ? '$name — Face Attendance' : "Face Attendance");
+          },
+        ),
         centerTitle: true,
         actions: [
           // Internet Status Indicator
@@ -520,11 +526,11 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             decoration: BoxDecoration(
               color: _isConnected
-                  ? Colors.green.withOpacity(0.1)
-                  : Colors.red.withOpacity(0.1),
+                  ? KioskColors.success.withValues(alpha: 0.1)
+                  : KioskColors.error.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
-                color: _isConnected ? Colors.green : Colors.red,
+                color: _isConnected ? KioskColors.success : KioskColors.error,
                 width: 1,
               ),
             ),
@@ -532,14 +538,14 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
               children: [
                 Icon(
                   _isConnected ? Icons.wifi : Icons.wifi_off,
-                  color: _isConnected ? Colors.green : Colors.red,
+                  color: _isConnected ? KioskColors.success : KioskColors.error,
                   size: 16,
                 ),
                 const SizedBox(width: 4),
                 Text(
                   _isConnected ? "Online" : "Offline",
                   style: TextStyle(
-                    color: _isConnected ? Colors.green : Colors.red,
+                    color: _isConnected ? KioskColors.success : KioskColors.error,
                     fontWeight: FontWeight.bold,
                     fontSize: 12,
                   ),
@@ -575,9 +581,9 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                     Container(
                       padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
-                        color: Colors.blue.withOpacity(0.1),
+                        color: KioskColors.info.withValues(alpha: 0.1),
                         borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                        border: Border.all(color: KioskColors.info.withValues(alpha: 0.3)),
                       ),
                       child: Text(
                         _statusMessage,
@@ -585,7 +591,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                         style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w500,
-                          color: Colors.blue.shade800,
+                          color: KioskColors.info,
                         ),
                       ),
                     ),
@@ -660,8 +666,8 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                     child: _buildActionButton(
                       label: "TIME IN",
                       color: _selectedEmployee != null
-                          ? Colors.green
-                          : Colors.grey,
+                          ? KioskColors.success
+                          : KioskColors.muted,
                       icon: Icons.login,
                       onPressed: _isProcessing
                           ? null
@@ -673,8 +679,8 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                     child: _buildActionButton(
                       label: "TIME OUT",
                       color: _selectedEmployee != null
-                          ? Colors.orange
-                          : Colors.grey,
+                          ? KioskColors.warning
+                          : KioskColors.muted,
                       icon: Icons.logout,
                       onPressed: _isProcessing
                           ? null
@@ -708,7 +714,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                 SizedBox(height: 12),
                 Text(
                   'Loading employees...',
-                  style: TextStyle(color: Colors.grey),
+                  style: TextStyle(color: KioskColors.muted),
                 ),
               ],
             ),
@@ -735,13 +741,13 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
-                  color: Colors.blue.shade50,
+                  color: KioskColors.info.withValues(alpha: 0.1),
                   shape: BoxShape.circle,
                 ),
                 child: Icon(
                   Icons.person_search_rounded,
                   size: 28,
-                  color: Colors.blue.shade700,
+                  color: KioskColors.info,
                 ),
               ),
               const SizedBox(width: 16),
@@ -760,7 +766,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                     const SizedBox(height: 4),
                     Text(
                       'Tap to select your name',
-                      style: TextStyle(fontSize: 14, color: Colors.grey[500]),
+                      style: TextStyle(fontSize: 14, color: KioskColors.muted),
                     ),
                   ],
                 ),
@@ -768,7 +774,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
               Icon(
                 Icons.arrow_forward_ios_rounded,
                 size: 20,
-                color: Colors.grey[400],
+                color: KioskColors.muted,
               ),
             ],
           ),
@@ -863,7 +869,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                   const SizedBox(height: 2),
                   Text(
                     emp['position'] ?? '',
-                    style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                    style: TextStyle(fontSize: 14, color: KioskColors.muted),
                   ),
                   const SizedBox(height: 4),
                   Row(
@@ -871,14 +877,14 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
                       Icon(
                         Icons.verified_rounded,
                         size: 14,
-                        color: Colors.green.shade600,
+                        color: KioskColors.success,
                       ),
                       const SizedBox(width: 4),
                       Text(
                         'Ready to verify',
                         style: TextStyle(
                           fontSize: 12,
-                          color: Colors.green.shade600,
+                          color: KioskColors.success,
                           fontWeight: FontWeight.w500,
                         ),
                       ),
@@ -894,8 +900,8 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
               icon: const Icon(Icons.swap_horiz_rounded, size: 18),
               label: const Text('Change'),
               style: TextButton.styleFrom(
-                foregroundColor: Colors.blue.shade700,
-                backgroundColor: Colors.blue.shade50,
+                foregroundColor: KioskColors.info,
+                backgroundColor: KioskColors.info.withValues(alpha: 0.1),
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(10),
                 ),
@@ -945,7 +951,7 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
   Widget _buildSyncStatusBadge() {
     final status = _syncStatus!;
     final hasFailed = status.failedCount > 0;
-    final color = hasFailed ? Colors.red : Colors.orange;
+    final color = hasFailed ? KioskColors.error : KioskColors.warning;
     final label = hasFailed
         ? '${status.failedCount} sync issue${status.failedCount == 1 ? '' : 's'}'
         : '${status.pendingCount} pending';
@@ -985,61 +991,118 @@ class _FaceScanScreenState extends State<FaceScanScreen> {
     );
   }
 
-  void _showSyncStatusDialog(SyncStatus status) {
+  void _showSyncStatusDialog(SyncStatus initialStatus) {
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Sync Status'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (status.pendingCount > 0)
-                  Text(
-                    '${status.pendingCount} record(s) waiting to sync — '
-                    'will retry automatically once online.',
-                  ),
-                if (status.failedCount > 0) ...[
-                  if (status.pendingCount > 0) const SizedBox(height: 12),
-                  const Text(
-                    'These could not be synced and were not recorded on '
-                    'the server:',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 8),
-                  for (final log in status.failedLogs)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Text(
-                        '• Attendance (employee ${log['employee_id']}, '
-                        '${log['type']}, ${log['timestamp']}): '
-                        '${log['sync_error']}',
-                        style: const TextStyle(fontSize: 13),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          var status = initialStatus;
+
+          Future<void> clearOne({int? logId, int? encodingId}) async {
+            await _supabaseService.clearSyncIssue(
+              logId: logId,
+              encodingId: encodingId,
+            );
+            final refreshed = await _supabaseService.getSyncStatus();
+            setDialogState(() => status = refreshed);
+            _refreshSyncStatus();
+          }
+
+          Future<void> clearAll() async {
+            await _supabaseService.clearAllSyncIssues();
+            final refreshed = await _supabaseService.getSyncStatus();
+            setDialogState(() => status = refreshed);
+            _refreshSyncStatus();
+          }
+
+          return AlertDialog(
+            title: const Text('Sync Status'),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (status.pendingCount > 0)
+                      Text(
+                        '${status.pendingCount} record(s) waiting to sync — '
+                        'will retry automatically once online.',
                       ),
-                    ),
-                  for (final enc in status.failedEncodings)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Text(
-                        '• Face data (employee ${enc['employee_id']}): '
-                        '${enc['sync_error']}',
-                        style: const TextStyle(fontSize: 13),
+                    if (status.failedCount > 0) ...[
+                      if (status.pendingCount > 0) const SizedBox(height: 12),
+                      const Text(
+                        'These could not be synced and were not recorded on '
+                        'the server. If this is a known duplicate (e.g. a '
+                        'double check-in), you can clear it:',
+                        style: TextStyle(fontWeight: FontWeight.bold),
                       ),
-                    ),
-                ],
-              ],
+                      const SizedBox(height: 8),
+                      for (final log in status.failedLogs)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  '• Attendance (employee ${log['employee_id']}, '
+                                  '${log['type']}, ${log['timestamp']}): '
+                                  '${log['sync_error']}',
+                                  style: const TextStyle(fontSize: 13),
+                                ),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.close, size: 16),
+                                tooltip: 'Clear this issue',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () =>
+                                    clearOne(logId: log['id'] as int),
+                              ),
+                            ],
+                          ),
+                        ),
+                      for (final enc in status.failedEncodings)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  '• Face data (employee ${enc['employee_id']}): '
+                                  '${enc['sync_error']}',
+                                  style: const TextStyle(fontSize: 13),
+                                ),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.close, size: 16),
+                                tooltip: 'Clear this issue',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () =>
+                                    clearOne(encodingId: enc['id'] as int),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ],
+                ),
+              ),
             ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
-        ],
+            actions: [
+              if (status.failedCount > 0)
+                TextButton(
+                  onPressed: clearAll,
+                  child: const Text('Clear all issues'),
+                ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Close'),
+              ),
+            ],
+          );
+        },
       ),
     );
   }

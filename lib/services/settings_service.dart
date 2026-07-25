@@ -94,4 +94,37 @@ class SettingsService {
     await prefs.remove(_keyOfficeLng);
     await prefs.remove(_keyGeofenceRadius);
   }
+
+  /// Apply the location config pushed from the dashboard via the server's
+  /// ping response. `null` means this device isn't assigned to a location
+  /// yet — a no-op, so unassigned devices are unaffected. Non-null
+  /// overwrites every field, reproducing exactly what an admin manually
+  /// setting/clearing each value in [SettingsScreen] would do.
+  Future<void> applyServerLocation(Map<String, dynamic>? location) async {
+    if (location == null) return;
+
+    final wifiSsid = location['officeWifiSsid'] as String?;
+    if (wifiSsid != null && wifiSsid.isNotEmpty) {
+      await setWifiSSID(wifiSsid);
+    } else {
+      await resetWifiSSID();
+    }
+
+    final wifiBssid = location['officeWifiBssid'] as String?;
+    if (wifiBssid != null && wifiBssid.isNotEmpty) {
+      await setWifiBSSID(wifiBssid);
+    } else {
+      await resetWifiBSSID();
+    }
+
+    final lat = (location['officeLat'] as num?)?.toDouble();
+    final lng = (location['officeLng'] as num?)?.toDouble();
+    if (lat != null && lng != null) {
+      final radius = (location['geofenceRadiusM'] as num?)?.toDouble() ??
+          defaultGeofenceRadiusMeters;
+      await setGeofence(lat, lng, radius);
+    } else {
+      await resetGeofence();
+    }
+  }
 }

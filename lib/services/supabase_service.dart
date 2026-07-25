@@ -12,6 +12,9 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import '../config/app_config.dart';
 import 'local_database_service.dart';
 import 'face_service.dart';
+import 'device_reporting_service.dart';
+import 'settings_service.dart';
+import 'network_service.dart';
 
 /// Snapshot of offline records still waiting to sync or that the server
 /// permanently rejected (e.g. too old, or a genuine conflict).
@@ -37,14 +40,24 @@ class SupabaseService {
 
   final SupabaseClient _client = Supabase.instance.client;
   final LocalDatabaseService _localDb = LocalDatabaseService();
+  final NetworkService _networkService = NetworkService();
   Timer? _syncTimer;
   StreamSubscription<List<ConnectivityResult>>? _reconnectSyncSubscription;
   bool _wasOnline = true;
+  bool _syncingLogs = false;
+  bool _syncingEncodings = false;
+
+  /// Name of the company this device's MOBILE_API_KEY is provisioned for
+  /// (multi-tenant deployment — every device belongs to exactly one
+  /// company). Populated by [pingServer]; null until the first successful
+  /// ping. A ValueNotifier so screens can reactively show it without
+  /// each one re-fetching it themselves.
+  final ValueNotifier<String?> companyName = ValueNotifier<String?>(null);
 
   /// Check internet connectivity
   Future<bool> get isOnline async {
     final connectivityResult = await Connectivity().checkConnectivity();
-    return connectivityResult != ConnectivityResult.none;
+    return connectivityResult.any((r) => r != ConnectivityResult.none);
   }
 
   // --- Synchronization ---
@@ -109,6 +122,10 @@ class SupabaseService {
       }
     } catch (e) {
       debugPrint('Sync Error: $e');
+      DeviceReportingService.instance.reportError(
+        'Employee sync failed: $e',
+        context: 'syncEmployees',
+      );
     }
   }
 
@@ -240,6 +257,21 @@ class SupabaseService {
     return responseBody;
   }
 
+  /// Pushes the current sync-health snapshot to the dashboard so admins have
+  /// a live per-device heartbeat, not just error events. Best-effort — see
+  /// [DeviceReportingService].
+  Future<void> _reportSyncHeartbeat() async {
+    try {
+      final status = await getSyncStatus();
+      await DeviceReportingService.instance.reportSyncStatus(
+        pendingCount: status.pendingCount,
+        failedCount: status.failedCount,
+      );
+    } catch (e) {
+      debugPrint('Failed to report sync heartbeat: $e');
+    }
+  }
+
   /// Counts of records still waiting to sync or that permanently failed —
   /// surfaced in the UI so an outage isn't invisible until logs start
   /// aging out of the server's sync window.
@@ -255,92 +287,152 @@ class SupabaseService {
     );
   }
 
+  /// Dismisses a single sync issue (log or encoding) without retrying it —
+  /// e.g. a duplicate "Already timed in" rejection where the real record
+  /// already made it to the server.
+  Future<void> clearSyncIssue({int? logId, int? encodingId}) async {
+    if (logId != null) await _localDb.clearFailedLog(logId);
+    if (encodingId != null) await _localDb.clearFailedEncoding(encodingId);
+  }
+
+  Future<void> clearAllSyncIssues() async {
+    await _localDb.clearFailedLogs();
+    await _localDb.clearFailedEncodings();
+  }
+
   Future<void> syncLogs() async {
+    // syncLogs() is triggered concurrently from the periodic timer, the
+    // reconnect listener, and every recordAttendance() call. Without this
+    // guard, two overlapping runs can both fetch and POST the same
+    // unsynced row; the server's duplicate guard rejects the second POST,
+    // and that (actually-synced) record gets mislabeled as permanently
+    // failed. A second call while one is in flight just no-ops — the
+    // periodic timer/reconnect listener will pick up anything left over.
+    if (_syncingLogs) return;
     if (!await isOnline) return;
 
-    final logs = await _localDb.getUnsyncedLogs();
-    if (logs.isEmpty) return;
+    _syncingLogs = true;
+    try {
+      final logs = await _localDb.getUnsyncedLogs();
+      if (logs.isEmpty) return;
 
-    for (var log in logs) {
-      try {
-        final timestamp = log['timestamp'] as String;
-        final timeStr = timestamp.split('T')[1].substring(0, 8);
+      for (var log in logs) {
+        try {
+          final timestamp = log['timestamp'] as String;
+          final timeStr = timestamp.split('T')[1].substring(0, 8);
 
-        final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/attendance/log');
-        final response = await http.post(
-          url,
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': AppConfig.mobileApiKey,
-          },
-          body: jsonEncode({
-            'employeeId': log['employee_id'],
-            'type': log['type'],
-            'time': timeStr,
-            'timestamp': timestamp,
-          }),
-        );
+          final url = Uri.parse(
+            '${AppConfig.nextJsBaseUrl}/api/attendance/log',
+          );
+          final response = await http.post(
+            url,
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': AppConfig.mobileApiKey,
+            },
+            body: jsonEncode({
+              'employeeId': log['employee_id'],
+              'type': log['type'],
+              'time': timeStr,
+              'timestamp': timestamp,
+              if (log['lat'] != null) 'lat': log['lat'],
+              if (log['lng'] != null) 'lng': log['lng'],
+              if (log['is_mocked'] != null) 'isMocked': log['is_mocked'] == 1,
+              if (log['wifi_ssid'] != null) 'wifiSsid': log['wifi_ssid'],
+              if (log['wifi_bssid'] != null) 'wifiBssid': log['wifi_bssid'],
+            }),
+          );
 
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          // Mark as synced only if successful
-          await _localDb.markLogsAsSynced([log['id'] as int]);
-        } else if (response.statusCode >= 400 && response.statusCode < 500) {
-          // Client error (e.g. 'Already timed in', or too old to sync).
-          // Retrying won't fix it, but unlike a real success this must stay
-          // visible — silently discarding it would mean this attendance
-          // record is gone with no trace anywhere.
-          final reason = _extractErrorMessage(response.body);
-          debugPrint('Client error syncing log ${log['id']}: $reason');
-          await _localDb.markLogsAsFailed([log['id'] as int], reason);
-        } else {
-          debugPrint(
-            'Failed to sync log ${log['id']} (Server error): ${response.body}',
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            // Mark as synced only if successful
+            await _localDb.markLogsAsSynced([log['id'] as int]);
+          } else if (response.statusCode >= 400 && response.statusCode < 500) {
+            // Client error (e.g. 'Already timed in', or too old to sync).
+            // Retrying won't fix it, but unlike a real success this must stay
+            // visible — silently discarding it would mean this attendance
+            // record is gone with no trace anywhere.
+            final reason = _extractErrorMessage(response.body);
+            debugPrint('Client error syncing log ${log['id']}: $reason');
+            await _localDb.markLogsAsFailed([log['id'] as int], reason);
+          } else {
+            debugPrint(
+              'Failed to sync log ${log['id']} (Server error): ${response.body}',
+            );
+            DeviceReportingService.instance.reportError(
+              'Server error syncing attendance log: HTTP ${response.statusCode}',
+              context: 'syncLogs log=${log['id']} body=${response.body}',
+            );
+          }
+        } catch (e) {
+          debugPrint('Failed to sync log ${log['id']}: $e');
+          DeviceReportingService.instance.reportError(
+            'Failed to sync attendance log: $e',
+            context: 'syncLogs log=${log['id']}',
           );
         }
-      } catch (e) {
-        debugPrint('Failed to sync log ${log['id']}: $e');
       }
+    } finally {
+      _syncingLogs = false;
     }
   }
 
   /// Syncs offline face encodings to Supabase (Up Sync)
   Future<void> syncEncodings() async {
+    // Same overlapping-callers issue as syncLogs() — see the comment there.
+    if (_syncingEncodings) return;
     if (!await isOnline) return;
 
-    final encodings = await _localDb.getUnsyncedEncodings();
-    if (encodings.isEmpty) return;
+    _syncingEncodings = true;
+    try {
+      final encodings = await _localDb.getUnsyncedEncodings();
+      if (encodings.isEmpty) return;
 
-    for (var enc in encodings) {
-      try {
-        final descriptorStr = enc['descriptor'] as String;
-        final descriptor = jsonDecode(descriptorStr) as List<dynamic>;
+      for (var enc in encodings) {
+        try {
+          final descriptorStr = enc['descriptor'] as String;
+          final descriptor = jsonDecode(descriptorStr) as List<dynamic>;
 
-        final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/face-encoding');
-        final response = await http.post(
-          url,
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': AppConfig.mobileApiKey,
-          },
-          body: jsonEncode({
-            'employeeId': enc['employee_id'],
-            'descriptor': descriptor,
-            'isGolden': enc['is_golden'] == 1,
-          }),
-        );
+          final url = Uri.parse(
+            '${AppConfig.nextJsBaseUrl}/api/face-encoding',
+          );
+          final response = await http.post(
+            url,
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': AppConfig.mobileApiKey,
+            },
+            body: jsonEncode({
+              'employeeId': enc['employee_id'],
+              'descriptor': descriptor,
+              'isGolden': enc['is_golden'] == 1,
+            }),
+          );
 
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          await _localDb.markEncodingsAsSynced([enc['id'] as int]);
-        } else if (response.statusCode >= 400 && response.statusCode < 500) {
-          final reason = _extractErrorMessage(response.body);
-          debugPrint('Client error syncing encoding ${enc['id']}: $reason');
-          await _localDb.markEncodingsAsFailed([enc['id'] as int], reason);
-        } else {
-          debugPrint('Failed to sync encoding ${enc['id']}: ${response.body}');
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            await _localDb.markEncodingsAsSynced([enc['id'] as int]);
+          } else if (response.statusCode >= 400 && response.statusCode < 500) {
+            final reason = _extractErrorMessage(response.body);
+            debugPrint('Client error syncing encoding ${enc['id']}: $reason');
+            await _localDb.markEncodingsAsFailed([enc['id'] as int], reason);
+          } else {
+            debugPrint(
+              'Failed to sync encoding ${enc['id']}: ${response.body}',
+            );
+            DeviceReportingService.instance.reportError(
+              'Server error syncing face encoding: HTTP ${response.statusCode}',
+              context: 'syncEncodings encoding=${enc['id']} body=${response.body}',
+            );
+          }
+        } catch (e) {
+          debugPrint('Failed to sync encoding ${enc['id']}: $e');
+          DeviceReportingService.instance.reportError(
+            'Failed to sync face encoding: $e',
+            context: 'syncEncodings encoding=${enc['id']}',
+          );
         }
-      } catch (e) {
-        debugPrint('Failed to sync encoding ${enc['id']}: $e');
       }
+    } finally {
+      _syncingEncodings = false;
     }
   }
 
@@ -362,6 +454,7 @@ class SupabaseService {
             await syncEmployees();
             await syncLogs();
             await syncEncodings();
+            await _reportSyncHeartbeat();
           } else {
             debugPrint('Background sync skipped: server unreachable');
           }
@@ -382,12 +475,14 @@ class SupabaseService {
         final justReconnected = isConnected && !_wasOnline;
         _wasOnline = isConnected;
         if (justReconnected) {
-          syncLogs().catchError((e) {
-            debugPrint('Reconnect sync (logs) failed: $e');
-          });
-          syncEncodings().catchError((e) {
-            debugPrint('Reconnect sync (encodings) failed: $e');
-          });
+          Future.wait([
+            syncLogs().catchError((e) {
+              debugPrint('Reconnect sync (logs) failed: $e');
+            }),
+            syncEncodings().catchError((e) {
+              debugPrint('Reconnect sync (encodings) failed: $e');
+            }),
+          ]).then((_) => _reportSyncHeartbeat());
         }
       });
     } catch (e) {
@@ -412,7 +507,30 @@ class SupabaseService {
           )
           .timeout(timeout);
 
-      if (response.statusCode == 200) return true;
+      if (response.statusCode == 200) {
+        Map<String, dynamic>? body;
+        try {
+          body = jsonDecode(response.body) as Map<String, dynamic>;
+        } catch (e) {
+          debugPrint('Ping response not valid JSON: $e');
+        }
+
+        try {
+          final name = body?['company_name'] as String?;
+          if (name != null) companyName.value = name;
+        } catch (e) {
+          debugPrint('Ping response missing/invalid company_name: $e');
+        }
+
+        try {
+          await SettingsService().applyServerLocation(
+            body?['location'] as Map<String, dynamic>?,
+          );
+        } catch (e) {
+          debugPrint('Ping response missing/invalid location: $e');
+        }
+        return true;
+      }
       debugPrint('Ping server returned ${response.statusCode}');
       return false;
     } catch (e) {
@@ -429,6 +547,7 @@ class SupabaseService {
         syncEmployees();
         syncLogs();
         syncEncodings();
+        _reportSyncHeartbeat();
       } else {
         if (attemptsRemaining > 0) {
           debugPrint(
@@ -589,20 +708,42 @@ class SupabaseService {
       };
     }
 
-    // Local didn't find a match. If online, fall back to server RPC (and trigger background sync if successful).
+    // Local didn't find a match. If online, fall back to a server-side match
+    // via the Next.js API (and trigger background sync if successful).
+    //
+    // This used to call Supabase's `match_face` RPC directly via _client.rpc,
+    // bypassing the Next.js API entirely and querying with the anon key,
+    // which has no per-tenant identity — a face captured at one company's
+    // kiosk could match an employee belonging to a different company once
+    // multiple companies shared that RPC's table. Routing through
+    // /api/match-face instead means the kiosk's own x-api-key resolves the
+    // company server-side (see resolveKioskCompany in the Next.js app), the
+    // same way every other mobile endpoint already works, and it stays
+    // scoped even in local dev against a database Supabase's own RPC
+    // wouldn't know about.
     if (await isOnline) {
       try {
-        final vectorStr = '[${normalizedEmbedding.join(',')}]';
-        final response = await _client.rpc(
-          'match_face',
-          params: {
-            'query_embedding': vectorStr,
+        final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/match-face');
+        final response = await http.post(
+          url,
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': AppConfig.mobileApiKey,
+          },
+          body: jsonEncode({
+            'query_embedding': normalizedEmbedding,
             'match_threshold': 0.7,
             'match_count': 1,
-          },
+          }),
         );
 
-        final List<dynamic> results = response;
+        if (response.statusCode != 200) {
+          throw Exception(
+            'Match face request failed: ${response.statusCode} ${response.body}',
+          );
+        }
+
+        final List<dynamic> results = jsonDecode(response.body);
         if (results.isEmpty) return null;
 
         final match = results.first as Map<String, dynamic>;
@@ -752,8 +893,37 @@ class SupabaseService {
 
     final now = DateTime.now();
 
+    // Best-effort — capture what's true right now (not at whatever later
+    // moment this record finally syncs), degrading gracefully if location
+    // services are off/denied. Read in parallel so this doesn't add up
+    // the individual timeouts on top of each other.
+    GeoReading? geo;
+    String? ssid;
+    String? bssid;
+    try {
+      final results = await Future.wait([
+        _networkService.getCurrentGeoReading(),
+        _networkService.getCurrentSSID(),
+        _networkService.getCurrentBSSID(),
+      ]);
+      geo = results[0] as GeoReading?;
+      ssid = results[1] as String?;
+      bssid = results[2] as String?;
+    } catch (e) {
+      debugPrint('recordAttendance: failed to read location/wifi signals: $e');
+    }
+
     // Always save to the local database immediately to provide instant feedback
-    await _localDb.insertOfflineLog(employeeId, effectiveType, now);
+    await _localDb.insertOfflineLog(
+      employeeId,
+      effectiveType,
+      now,
+      lat: geo?.latitude,
+      lng: geo?.longitude,
+      isMocked: geo?.isMocked,
+      wifiSsid: ssid,
+      wifiBssid: bssid,
+    );
 
     // Fire and forget background sync to upload the log without blocking the user
     isOnline.then((online) {

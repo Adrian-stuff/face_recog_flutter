@@ -3,14 +3,25 @@ import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import '../config/kiosk_config.generated.dart';
+// Re-exported so existing consumers of this file (liveness_check_screen.dart,
+// test/liveness_service_test.dart) keep seeing LivenessGesture without each
+// needing its own import of the generated config — it used to be defined
+// here directly.
+export '../config/kiosk_config.generated.dart' show LivenessGesture;
 
 /// Phases of the active liveness challenge.
 enum LivenessPhase { positionFace, gesture, colorChallenge, passed, failed }
 
-/// The randomized action asked of the user during [LivenessPhase.gesture].
-/// A fresh gesture is drawn per attempt so a replayed video of a single
-/// past gesture can't be pre-recorded and reused for the next check-in.
-enum LivenessGesture { blink, smile, turnLeft, turnRight }
+// LivenessGesture and the thresholds/timing below come from
+// KioskConfig/KioskStrings (lib/config/kiosk_config.generated.dart),
+// generated from the payroll-system repo's shared/kiosk-config.json — the
+// single source of truth also consumed by the Next.js web kiosk, so the
+// two platforms can't silently drift out of sync. Edit that JSON file and
+// re-run shared/generate-configs.mjs, don't hand-edit values here.
+//
+// A fresh gesture is drawn per attempt so a replayed video of a single
+// past gesture can't be pre-recorded and reused for the next check-in.
 
 /// Colors cycled during the color-challenge phase.
 /// We use 3 distinct hues so brightness-shift analysis is meaningful.
@@ -45,7 +56,9 @@ class LivenessService {
   // working for this face/lighting/device (e.g. a device that never reports
   // a smilingProbability) and swap to a different randomly-chosen gesture
   // rather than stalling the whole check.
-  static const Duration _perGestureTimeout = Duration(seconds: 8);
+  static const Duration _perGestureTimeout = Duration(
+    milliseconds: KioskConfig.perGestureTimeoutMs,
+  );
 
   // ── Blink sub-state ────────────────────────────────────────────
   int _eyesClosedFrames = 0;
@@ -53,8 +66,8 @@ class LivenessService {
   bool _sawEyesClosed = false;
   static const int _requiredClosedFrames = 1;
   static const int _requiredOpenFrames = 1;
-  static const double _closedThreshold = 0.45;
-  static const double _openThreshold = 0.55;
+  static const double _closedThreshold = KioskConfig.eyeBlinkThresholdLow;
+  static const double _openThreshold = KioskConfig.eyeBlinkThresholdHigh;
 
   // ── Smile sub-state ────────────────────────────────────────────
   // Requires a neutral→smile transition (not just "is smiling") so a photo
@@ -64,8 +77,8 @@ class LivenessService {
   bool _sawNeutral = false;
   static const int _requiredNeutralFrames = 1;
   static const int _requiredSmileFrames = 1;
-  static const double _neutralSmileThreshold = 0.4;
-  static const double _smileThreshold = 0.75;
+  static const double _neutralSmileThreshold = KioskConfig.smileThresholdLow;
+  static const double _smileThreshold = KioskConfig.smileThresholdHigh;
 
   // ── Head-turn sub-state ────────────────────────────────────────
   // Requires turn-away-then-return-to-center, so a photo held at a fixed
@@ -79,8 +92,8 @@ class LivenessService {
   // Confirmed on a real device: positive headEulerAngleY = turned toward
   // the viewer's left (opposite of the usual ML Kit Flutter sample
   // convention — front camera mirroring varies by device/OEM camera stack).
-  static const double _turnThreshold = 15.0;
-  static const double _centerThreshold = 8.0;
+  static const double _turnThreshold = KioskConfig.turnThresholdDeg;
+  static const double _centerThreshold = KioskConfig.turnCenterThresholdDeg;
 
   // ── Color challenge (currently unused, see below) ──────────────
   int _currentColorIndex = 0;
@@ -92,33 +105,37 @@ class LivenessService {
   static const double _varianceThreshold = 1.5;
 
   // ── Instruction text for the UI ────────────────────────────────
+  // Base strings (position/gesture prompts) come from KioskStrings, shared
+  // with the web kiosk. The richer progressive turn feedback below ("Keep
+  // turning...", "Almost there...") is a Flutter-specific enhancement on
+  // top of that shared base, not currently replicated on web.
   String get instruction {
     switch (_phase) {
       case LivenessPhase.positionFace:
-        return 'Position your face inside the oval';
+        return KioskStrings.positionFace;
       case LivenessPhase.gesture:
         return _gestureInstruction;
       case LivenessPhase.colorChallenge:
         return 'Hold still…';
       case LivenessPhase.passed:
-        return 'Verified ✓';
+        return '${KioskStrings.passed} ✓';
       case LivenessPhase.failed:
-        return 'Verification failed';
+        return KioskStrings.failed;
     }
   }
 
   String get _gestureInstruction {
     switch (_currentGesture) {
       case LivenessGesture.blink:
-        return 'Please blink';
+        return KioskStrings.gestureBlink;
       case LivenessGesture.smile:
-        return 'Please smile';
+        return KioskStrings.gestureSmile;
       case LivenessGesture.turnLeft:
         return _turnInstruction(turnLeft: true);
       case LivenessGesture.turnRight:
         return _turnInstruction(turnLeft: false);
       case null:
-        return 'Get ready…';
+        return KioskStrings.gestureGetReady;
     }
   }
 
@@ -128,7 +145,9 @@ class LivenessService {
     final angle = _lastHeadEulerAngleY;
     final label = turnLeft ? 'left' : 'right';
     final facingWrongWay = angle == null || (turnLeft ? angle <= 0 : angle >= 0);
-    if (facingWrongWay) return 'Turn your head $label';
+    if (facingWrongWay) {
+      return turnLeft ? KioskStrings.gestureTurnLeft : KioskStrings.gestureTurnRight;
+    }
     if (turnProgress < 0.5) return 'Keep turning $label...';
     return 'Almost there — a bit more $label';
   }

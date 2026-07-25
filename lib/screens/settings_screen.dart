@@ -220,6 +220,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.amber[50],
+                      border: Border.all(color: Colors.amber[200]!),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(Icons.info_outline, size: 18, color: Colors.amber[800]),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            "These values sync automatically from the dashboard when this "
+                            "device is connected to a location. Manual changes here will be "
+                            "overwritten on the next successful sync.",
+                            style: TextStyle(fontSize: 12, color: Colors.amber[900]),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   // ── Network Configuration ──
                   const Text(
                     "Network Configuration",

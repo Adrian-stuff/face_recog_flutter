@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:screen_brightness/screen_brightness.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../config/kiosk_config.generated.dart';
 import '../services/face_service.dart';
 import '../services/liveness_service.dart';
 import '../widgets/camera_view.dart';
@@ -260,7 +261,7 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Liveness check timed out. Please try again.'),
-          backgroundColor: Colors.red,
+          backgroundColor: KioskColors.error,
         ),
       );
       Navigator.pop(context, null);
@@ -287,16 +288,16 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
         borderColor = Colors.white;
         break;
       case LivenessPhase.gesture:
-        borderColor = Colors.amber;
+        borderColor = KioskColors.warning;
         break;
       case LivenessPhase.colorChallenge:
         borderColor = _liveness.currentChallengeColor;
         break;
       case LivenessPhase.passed:
-        borderColor = Colors.greenAccent;
+        borderColor = KioskColors.success;
         break;
       case LivenessPhase.failed:
-        borderColor = Colors.red;
+        borderColor = KioskColors.error;
         break;
     }
 
@@ -371,7 +372,7 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
                       borderRadius: BorderRadius.circular(16),
                       border: Border.all(
                         color: _errorMessage != null
-                            ? Colors.red.withAlpha(160)
+                            ? KioskColors.error.withAlpha(160)
                             : borderColor.withAlpha(100),
                         width: 1,
                       ),
@@ -389,7 +390,7 @@ class _LivenessCheckScreenState extends State<LivenessCheckScreen>
                             textAlign: TextAlign.center,
                             style: TextStyle(
                               color: _errorMessage != null
-                                  ? Colors.redAccent
+                                  ? KioskColors.error
                                   : Colors.white,
                               fontSize: 20,
                               fontWeight: FontWeight.w600,
@@ -503,7 +504,7 @@ class _GestureOverlayIcon extends StatelessWidget {
     }
 
     if (_isTurnGesture) {
-      final glowColor = Color.lerp(Colors.white, Colors.greenAccent, turnProgress)!;
+      final glowColor = Color.lerp(Colors.white, KioskColors.success, turnProgress)!;
       return Positioned(
         left: left,
         top: top,
