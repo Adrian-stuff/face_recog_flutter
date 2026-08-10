@@ -297,26 +297,39 @@ class _SearchableEmployeeSelectorState
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Icon(
-                          Icons.search_off_rounded,
+                          // The roster being empty with no search typed means
+                          // this device has never synced one — a completely
+                          // different situation from a search matching
+                          // nothing, and one "try a different term" actively
+                          // misleads someone out of the actual fix.
+                          widget.employees.isEmpty
+                              ? Icons.cloud_off_rounded
+                              : Icons.search_off_rounded,
                           size: 56,
                           color: Colors.grey[300],
                         ),
                         const SizedBox(height: 12),
                         Text(
-                          'No employees found',
+                          widget.employees.isEmpty
+                              ? 'No employee roster on this device yet'
+                              : 'No employees found',
                           style: TextStyle(
                             fontSize: 16,
                             color: Colors.grey[500],
                             fontWeight: FontWeight.w500,
                           ),
+                          textAlign: TextAlign.center,
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          'Try a different search term',
+                          widget.employees.isEmpty
+                              ? 'Connect this device to WiFi or mobile data once to download it.'
+                              : 'Try a different search term',
                           style: TextStyle(
                             fontSize: 13,
                             color: Colors.grey[400],
                           ),
+                          textAlign: TextAlign.center,
                         ),
                       ],
                     ),

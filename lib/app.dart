@@ -1,6 +1,11 @@
 import 'package:flutter/material.dart';
 import 'screens/face_scan_screen.dart';
+import 'screens/network_setup_screen.dart';
+import 'screens/pairing_screen.dart';
+import 'widgets/connectivity_banner.dart';
 import 'widgets/network_guard.dart';
+import 'services/provisioning_service.dart';
+import 'services/supabase_service.dart';
 import 'services/update_service.dart';
 
 class FaceAttendanceApp extends StatefulWidget {
@@ -37,6 +42,28 @@ class _FaceAttendanceAppState extends State<FaceAttendanceApp> {
       builder: (context, child) {
         return Column(
           children: [
+            // Only meaningful once provisioned and syncing — during
+            // pairing/network-setup nothing updates connectivityStatus (it's
+            // only touched by the sync machinery FaceScanScreen starts), and
+            // those screens already run their own pingServer()-driven UI
+            // this would otherwise talk over.
+            ValueListenableBuilder<ProvisioningState>(
+              valueListenable: ProvisioningService.instance.state,
+              builder: (context, provisioningState, _) {
+                if (provisioningState != ProvisioningState.ready) {
+                  return const SizedBox.shrink();
+                }
+                return ValueListenableBuilder<ConnectivityStatus>(
+                  valueListenable: SupabaseService().connectivityStatus,
+                  builder: (context, status, _) {
+                    if (status == ConnectivityStatus.online) {
+                      return const SizedBox.shrink();
+                    }
+                    return ConnectivityBanner(status: status);
+                  },
+                );
+              },
+            ),
             if (_updateReady)
               MaterialBanner(
                 padding: const EdgeInsets.symmetric(
@@ -60,7 +87,25 @@ class _FaceAttendanceAppState extends State<FaceAttendanceApp> {
           ],
         );
       },
-      home: const NetworkGuard(child: FaceScanScreen()),
+      // Gates the kiosk on this device being bound to exactly one company.
+      // Listens rather than checking once, so a mismatch discovered by a
+      // background ping mid-shift swaps the UI immediately instead of
+      // leaving a scan screen up that can no longer record anything.
+      home: ValueListenableBuilder<ProvisioningState>(
+        valueListenable: ProvisioningService.instance.state,
+        builder: (context, state, _) {
+          switch (state) {
+            case ProvisioningState.unprovisioned:
+              return const PairingScreen();
+            case ProvisioningState.companyMismatch:
+              return const PairingScreen(isRebind: true);
+            case ProvisioningState.needsNetworkSetup:
+              return const NetworkSetupScreen();
+            case ProvisioningState.ready:
+              return const NetworkGuard(child: FaceScanScreen());
+          }
+        },
+      ),
     );
   }
 }

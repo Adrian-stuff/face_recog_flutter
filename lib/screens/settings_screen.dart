@@ -2,7 +2,8 @@ import 'package:flutter/material.dart';
 import '../services/settings_service.dart';
 import '../services/update_service.dart';
 import '../services/network_service.dart';
-import '../config/app_config.dart';
+import '../services/provisioning_service.dart';
+import '../services/supabase_service.dart';
 
 /// Message to show the admin for each way a WiFi scan can fail to run.
 String _wifiScanFailureMessage(WifiScanFailure reason) {
@@ -40,6 +41,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // Update state
   int? _patchNumber;
   bool _isCheckingUpdate = false;
+
+  // Device pairing state
+  final _supabaseService = SupabaseService();
+  bool _isUnpairing = false;
 
   @override
   void initState() {
@@ -199,6 +204,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _confirmUnpair() async {
+    final companyLabel = ProvisioningService.instance.companyName.value ?? 'this company';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Unpair this device?'),
+        content: Text(
+          "This device is currently paired to $companyLabel. Unpairing removes "
+          "its cached employee roster, photos, and face data, and stops it "
+          "from recording attendance until it's paired again with a new code "
+          'from the dashboard.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Unpair'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _isUnpairing = true);
+    // Same cleanup as an automatically-detected mismatch/revocation — no
+    // reportReason here since this is intentional, not a failure worth
+    // flagging to an admin reviewing device error reports.
+    await _supabaseService.haltSyncAndPurgeRoster();
+    await ProvisioningService.instance.unpair();
+    if (!mounted) return;
+
+    // app.dart's ValueListenableBuilder on ProvisioningState swaps `home` to
+    // PairingScreen now that state is unprovisioned — but this screen was
+    // reached via a Navigator stack on top of that (Registration → Settings),
+    // which the state change alone doesn't unwind.
+    Navigator.of(context).popUntil((route) => route.isFirst);
+  }
+
   @override
   void dispose() {
     _ssidController.dispose();
@@ -277,7 +324,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    "Default: ${AppConfig.officeWifiSSID}",
+                    "Leave blank to skip the WiFi check entirely.",
                     style: TextStyle(color: Colors.grey[600], fontSize: 12),
                   ),
                   const SizedBox(height: 16),
@@ -482,6 +529,99 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               ),
                             ),
                           ),
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 32),
+                  const Divider(),
+                  const SizedBox(height: 16),
+
+                  // ── Device Pairing ──
+                  const Text(
+                    "Device Pairing",
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 16),
+                  Card(
+                    elevation: 1,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.tablet_android, color: Colors.blue.shade700),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      ProvisioningService.instance.companyName.value ??
+                                          "Not paired to a company",
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 15,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      ProvisioningService.instance.isPaired
+                                          ? (ProvisioningService.instance.deviceLabel ??
+                                                "No device label on file")
+                                          : "Running on the shared legacy key — not "
+                                                "individually paired",
+                                      style: TextStyle(
+                                        color: Colors.grey[600],
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          if (ProvisioningService.instance.isPaired)
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                onPressed: _isUnpairing ? null : _confirmUnpair,
+                                icon: _isUnpairing
+                                    ? const SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                      )
+                                    : const Icon(Icons.link_off),
+                                label: Text(_isUnpairing ? "Unpairing..." : "Unpair This Device"),
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: Colors.red,
+                                  side: const BorderSide(color: Colors.red),
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                ),
+                              ),
+                            )
+                          else
+                            // A legacy-key device was never individually paired, so
+                            // there's no per-device credential to release — unpair()
+                            // only clears the paired key, and this device doesn't have
+                            // one (it runs on AppConfig.mobileApiKey instead). Showing
+                            // an "Unpair" button here would silently do nothing: the
+                            // app would just fall straight back to ready on the same
+                            // shared key. Point at the real fix instead.
+                            Text(
+                              "This device isn't individually paired, so there's "
+                              "nothing to unpair. Enter a pairing code from the "
+                              "dashboard to give it its own device identity.",
+                              style: TextStyle(color: Colors.grey[600], fontSize: 12),
+                            ),
                         ],
                       ),
                     ),

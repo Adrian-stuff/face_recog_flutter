@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart';
@@ -29,7 +30,7 @@ class LocalDatabaseService {
 
     return await openDatabase(
       path,
-      version: 5,
+      version: 7,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE employees (
@@ -43,6 +44,13 @@ class LocalDatabaseService {
           )
         ''');
 
+        // Must stay in sync with the cumulative result of every onUpgrade
+        // block below — onCreate only runs for a database that doesn't
+        // exist yet, so onUpgrade's incremental ALTER TABLEs never run for
+        // a fresh install. This table previously stopped at the v5 columns
+        // here, so any brand-new install (not an upgrade from an older
+        // version) got a table with no client_event_id at all, and every
+        // attendance write crashed with "no column named client_event_id".
         await db.execute('''
           CREATE TABLE attendance_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,7 +63,8 @@ class LocalDatabaseService {
             lng REAL,
             is_mocked INTEGER,
             wifi_ssid TEXT,
-            wifi_bssid TEXT
+            wifi_bssid TEXT,
+            client_event_id TEXT
           )
         ''');
 
@@ -70,6 +79,10 @@ class LocalDatabaseService {
             sync_error TEXT
           )
         ''');
+
+        await db.execute(_createScanEventsSql);
+        await db.execute(_scanEventsPendingIndexSql);
+        await db.execute(_createErrorReportsSql);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -122,24 +135,80 @@ class LocalDatabaseService {
             'ALTER TABLE attendance_logs ADD COLUMN wifi_bssid TEXT',
           );
         }
+        if (oldVersion < 6) {
+          // Two halves of the same problem: proving a scan happened, and
+          // being able to retry its upload safely.
+          //
+          // client_event_id is generated before the first upload attempt, so
+          // a retry after a lost response reconciles to the original server
+          // row rather than tripping the one-per-day unique constraint and
+          // being recorded as a permanent failure.
+          await db.execute(
+            'ALTER TABLE attendance_logs ADD COLUMN client_event_id TEXT',
+          );
+          // scan_events records every attempt, including the ones that never
+          // produced an attendance row at all — previously those vanished,
+          // which is exactly the case someone disputes later.
+          await db.execute(_createScanEventsSql);
+          await db.execute(_scanEventsPendingIndexSql);
+        }
+        if (oldVersion < 7) {
+          // Error reports were previously fire-and-forget HTTP calls only —
+          // if the device was offline (or the request otherwise failed)
+          // when a crash happened, the report was simply gone, including
+          // exactly the kind of crash an admin most needs to see (one that
+          // broke attendance recording). Writing it here first, before any
+          // network attempt, makes it durable the same way attendance logs
+          // and scan events already are.
+          await db.execute(_createErrorReportsSql);
+        }
       },
     );
   }
 
+  static const String _createScanEventsSql = '''
+    CREATE TABLE IF NOT EXISTS scan_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_event_id TEXT NOT NULL UNIQUE,
+      employee_id INTEGER,
+      employee_name TEXT,
+      scanned_at TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      attendance_type TEXT,
+      match_confidence REAL,
+      liveness_passed INTEGER,
+      thumbnail TEXT,
+      rejection_reason TEXT,
+      lat REAL,
+      lng REAL,
+      wifi_ssid TEXT,
+      wifi_bssid TEXT,
+      is_uploaded INTEGER DEFAULT 0,
+      server_confirmed INTEGER DEFAULT 0,
+      upload_attempts INTEGER DEFAULT 0,
+      last_attempt_at TEXT
+    )
+  ''';
+
+  // The upload loop's hot query: what still needs sending, oldest first.
+  static const String _scanEventsPendingIndexSql =
+      'CREATE INDEX IF NOT EXISTS idx_scan_events_pending '
+      'ON scan_events (is_uploaded, scanned_at)';
+
+  static const String _createErrorReportsSql = '''
+    CREATE TABLE IF NOT EXISTS error_reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      level TEXT NOT NULL,
+      message TEXT NOT NULL,
+      context TEXT,
+      app_version TEXT,
+      created_at TEXT NOT NULL,
+      is_uploaded INTEGER DEFAULT 0,
+      upload_attempts INTEGER DEFAULT 0
+    )
+  ''';
+
   // --- Synchronization Methods (Down: Supabase -> Local) ---
-
-  /// Pre-decode and normalize vectors for fast comparison
-  static List<double>? _decodeVector(String? featureStr) {
-    if (featureStr == null || featureStr.isEmpty) return null;
-
-    try {
-      final decoded = jsonDecode(featureStr);
-      if (decoded is List) {
-        return List<double>.from(decoded);
-      }
-    } catch (_) {}
-    return null;
-  }
 
   /// Pre-normalize a vector for O(1) cosine similarity (dot product only)
   static double _normalizeVector(List<double> vector) {
@@ -191,6 +260,93 @@ class LocalDatabaseService {
     debugPrint(
       'Synced ${employees.length} employees to local DB with pre-normalized vectors',
     );
+  }
+
+  /// Drops every trace of the current company's roster: employee rows, the
+  /// in-memory face vectors, and the cached avatar files.
+  ///
+  /// Called when a device turns out to be bound to a different company than
+  /// the one it was set up for. Attendance logs are deliberately left alone
+  /// — they are the evidence trail for work that actually happened, and
+  /// destroying them to tidy up a misconfiguration would be the more
+  /// damaging bug. They're marked orphaned instead (and, unlike a prior
+  /// version of this method, actually flagged is_synced so they truly stop
+  /// being retried — a row with only sync_error set was still picked up by
+  /// getUnsyncedLogs()'s `is_synced = 0` query, contradicting the "stop
+  /// being retried" this comment already promised).
+  ///
+  /// scan_events and error_reports get different treatment: they're not
+  /// evidence tied to a person's pay, they're this device's own upload
+  /// queue, and syncScanEvents()/syncPendingErrorReports() key off whatever
+  /// API key is currently loaded with no per-row company tag. Left alone,
+  /// any still-pending rows from the old company (thumbnails, employee
+  /// names, GPS/WiFi) would upload straight into whichever company this
+  /// device gets re-paired to next — a real cross-tenant leak, not just a
+  /// wasted retry. They're marked as already-uploaded here (suppressed, not
+  /// deleted) so the on-device history stays inspectable without ever
+  /// reaching the wrong company's dashboard.
+  Future<int> purgeTenantRoster() async {
+    final db = await database;
+
+    _vectorCache.clear();
+    _cacheInitialized = false;
+
+    final images = await db.query(
+      'employees',
+      columns: ['local_image_path'],
+      where: 'local_image_path IS NOT NULL',
+    );
+
+    final removed = await db.delete('employees');
+
+    await db.update(
+      'attendance_logs',
+      {
+        'is_synced': 1,
+        'sync_error': 'Orphaned: recorded before this device was re-paired',
+      },
+      where: 'is_synced = 0 AND sync_error IS NULL',
+    );
+    await db.update(
+      'offline_encodings',
+      {
+        'is_synced': 1,
+        'sync_error': 'Orphaned: recorded before this device was re-paired',
+      },
+      where: 'is_synced = 0 AND sync_error IS NULL',
+    );
+
+    final orphanedScans = await db.update(
+      'scan_events',
+      {
+        'is_uploaded': 1,
+        'rejection_reason': 'Orphaned: device was re-paired to a different company before this scan synced',
+      },
+      where: 'is_uploaded = 0 AND rejection_reason IS NULL',
+    );
+    final orphanedReports = await db.update(
+      'error_reports',
+      {'is_uploaded': 1},
+      where: 'is_uploaded = 0',
+    );
+
+    for (final row in images) {
+      final path = row['local_image_path'] as String?;
+      if (path == null) continue;
+      try {
+        final file = File(path);
+        if (await file.exists()) await file.delete();
+      } catch (e) {
+        debugPrint('purgeTenantRoster: failed to delete $path: $e');
+      }
+    }
+
+    debugPrint(
+      'purgeTenantRoster: removed $removed employees and their cached faces, '
+      'suppressed $orphanedScans pending scan events and $orphanedReports '
+      'pending error reports from the previous company',
+    );
+    return removed;
   }
 
   /// Initialize vector cache by decoding and normalizing all vectors
@@ -327,8 +483,9 @@ class LocalDatabaseService {
 
   // --- Offline Attendance Methods ---
 
-  Future<bool> hasLogForToday(int employeeId, String type) async {
-    final db = await database;
+  /// Start/end of the device's local calendar day, as the ISO strings
+  /// `timestamp` is stored and compared in throughout this table.
+  static (String, String) _todayBounds() {
     final now = DateTime.now();
     final startOfDay = DateTime(now.year, now.month, now.day).toIso8601String();
     final endOfDay = DateTime(
@@ -339,14 +496,57 @@ class LocalDatabaseService {
       59,
       59,
     ).toIso8601String();
+    return (startOfDay, endOfDay);
+  }
+
+  /// Rows with `sync_error` set were permanently rejected by the server
+  /// (duplicate, location check, stale timestamp, etc.) — they never became
+  /// a real punch there, so they must not count as "already recorded" here.
+  /// Otherwise one rejected sync permanently locks the employee out of that
+  /// action for the rest of the day, since nothing else ever clears the row.
+  Future<bool> hasLogForToday(int employeeId, String type) async {
+    final db = await database;
+    final (startOfDay, endOfDay) = _todayBounds();
 
     final result = await db.query(
       'attendance_logs',
-      where: 'employee_id = ? AND type = ? AND timestamp BETWEEN ? AND ?',
+      where:
+          'employee_id = ? AND type = ? AND timestamp BETWEEN ? AND ? AND sync_error IS NULL',
       whereArgs: [employeeId, type, startOfDay, endOfDay],
     );
 
     return result.isNotEmpty;
+  }
+
+  /// Every attendance punch recorded on this device today, newest first,
+  /// with the employee's name attached — what the kiosk shows an employee
+  /// who wants to see who's clocked in/out so far today.
+  ///
+  /// Inner-joined against the current `employees` table rather than trusting
+  /// `employee_id` alone: after a device is re-paired to a different
+  /// company, any leftover rows from the previous tenant have no matching
+  /// row here (the roster was purged — see purgeTenantRoster) and are
+  /// correctly excluded instead of showing as a name-less mystery entry.
+  Future<List<Map<String, dynamic>>> getTodayAttendance() async {
+    final db = await database;
+    final (startOfDay, endOfDay) = _todayBounds();
+
+    return db.rawQuery(
+      '''
+      SELECT
+        al.id,
+        al.employee_id,
+        e.first_name,
+        e.last_name,
+        al.type,
+        al.timestamp
+      FROM attendance_logs al
+      INNER JOIN employees e ON e.id = al.employee_id
+      WHERE al.timestamp BETWEEN ? AND ?
+      ORDER BY al.timestamp DESC
+      ''',
+      [startOfDay, endOfDay],
+    );
   }
 
   Future<void> insertLog(
@@ -359,6 +559,7 @@ class LocalDatabaseService {
     bool? isMocked,
     String? wifiSsid,
     String? wifiBssid,
+    String? clientEventId,
   }) async {
     if (await hasLogForToday(employeeId, type)) {
       throw Exception("Already recorded on this device today ($type)");
@@ -375,6 +576,7 @@ class LocalDatabaseService {
       'is_mocked': isMocked == null ? null : (isMocked ? 1 : 0),
       'wifi_ssid': wifiSsid,
       'wifi_bssid': wifiBssid,
+      'client_event_id': clientEventId,
     });
     debugPrint(
       '${isSynced ? "Online" : "Offline"} log saved for Employee $employeeId ($type)',
@@ -390,6 +592,7 @@ class LocalDatabaseService {
     bool? isMocked,
     String? wifiSsid,
     String? wifiBssid,
+    String? clientEventId,
   }) async {
     await insertLog(
       employeeId,
@@ -401,6 +604,293 @@ class LocalDatabaseService {
       isMocked: isMocked,
       wifiSsid: wifiSsid,
       wifiBssid: wifiBssid,
+      clientEventId: clientEventId,
+    );
+  }
+
+  // --- Scan evidence ---
+
+  /// Records one scan attempt, whatever came of it.
+  ///
+  /// Written before any network call so the evidence survives the app being
+  /// killed mid-sync. [clientEventId] is shared with the attendance log for
+  /// the same scan, which is what lets the server link the two and what makes
+  /// "they scanned but nothing was recorded" a query rather than a guess.
+  Future<void> insertScanEvent({
+    required String clientEventId,
+    required DateTime scannedAt,
+    required String outcome,
+    int? employeeId,
+    String? employeeName,
+    String? attendanceType,
+    double? matchConfidence,
+    bool? livenessPassed,
+    String? thumbnail,
+    String? rejectionReason,
+    double? lat,
+    double? lng,
+    String? wifiSsid,
+    String? wifiBssid,
+  }) async {
+    final db = await database;
+    await db.insert('scan_events', {
+      'client_event_id': clientEventId,
+      'employee_id': employeeId,
+      'employee_name': employeeName,
+      'scanned_at': scannedAt.toIso8601String(),
+      'outcome': outcome,
+      'attendance_type': attendanceType,
+      'match_confidence': matchConfidence,
+      'liveness_passed': livenessPassed == null ? null : (livenessPassed ? 1 : 0),
+      'thumbnail': thumbnail,
+      'rejection_reason': rejectionReason,
+      'lat': lat,
+      'lng': lng,
+      'wifi_ssid': wifiSsid,
+      'wifi_bssid': wifiBssid,
+      'is_uploaded': 0,
+      'server_confirmed': 0,
+      'upload_attempts': 0,
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+  }
+
+  /// Updates a scan's outcome once its attendance log's fate is known.
+  Future<void> updateScanOutcome(
+    String clientEventId,
+    String outcome, {
+    String? rejectionReason,
+  }) async {
+    final db = await database;
+    await db.update(
+      'scan_events',
+      {
+        'outcome': outcome,
+        if (rejectionReason != null) 'rejection_reason': rejectionReason,
+        // The server holds an older version of this row now, so re-upload it.
+        'is_uploaded': 0,
+      },
+      where: 'client_event_id = ?',
+      whereArgs: [clientEventId],
+    );
+  }
+
+  /// Scans still waiting to reach the server, oldest first.
+  ///
+  /// Skips rows already retried past [maxAttempts] so one permanently
+  /// unacceptable event (corrupt payload, say) can't stall the queue behind
+  /// it forever. Those stay in the table — visible in the history screen —
+  /// rather than being deleted.
+  Future<List<Map<String, dynamic>>> getPendingScanEvents({
+    int limit = 50,
+    int maxAttempts = 10,
+  }) async {
+    final db = await database;
+    return await db.query(
+      'scan_events',
+      where: 'is_uploaded = 0 AND upload_attempts < ?',
+      whereArgs: [maxAttempts],
+      orderBy: 'scanned_at ASC',
+      limit: limit,
+    );
+  }
+
+  Future<void> markScanEventsUploaded(List<String> clientEventIds) async {
+    if (clientEventIds.isEmpty) return;
+    final db = await database;
+    final placeholders = List.filled(clientEventIds.length, '?').join(',');
+    await db.rawUpdate(
+      'UPDATE scan_events SET is_uploaded = 1 WHERE client_event_id IN ($placeholders)',
+      clientEventIds,
+    );
+  }
+
+  Future<void> incrementScanUploadAttempts(List<String> clientEventIds) async {
+    if (clientEventIds.isEmpty) return;
+    final db = await database;
+    final placeholders = List.filled(clientEventIds.length, '?').join(',');
+    await db.rawUpdate(
+      'UPDATE scan_events SET upload_attempts = upload_attempts + 1, '
+      'last_attempt_at = ? WHERE client_event_id IN ($placeholders)',
+      [DateTime.now().toIso8601String(), ...clientEventIds],
+    );
+  }
+
+  // --- Error reports ---
+
+  /// Records an error/warning before any network attempt, so it survives
+  /// being offline (or the upload itself failing) instead of being lost the
+  /// moment it happens.
+  Future<int> insertErrorReport({
+    required String level,
+    required String message,
+    String? context,
+    String? appVersion,
+  }) async {
+    final db = await database;
+    return db.insert('error_reports', {
+      'level': level,
+      'message': message,
+      'context': context,
+      'app_version': appVersion,
+      'created_at': DateTime.now().toIso8601String(),
+      'is_uploaded': 0,
+      'upload_attempts': 0,
+    });
+  }
+
+  /// Reports still waiting to reach the server, oldest first. Caps attempts
+  /// like scan events, so one permanently-unsendable row (e.g. an
+  /// oversized context blob the server rejects) can't stall the rest.
+  Future<List<Map<String, dynamic>>> getPendingErrorReports({
+    int limit = 50,
+    int maxAttempts = 10,
+  }) async {
+    final db = await database;
+    return db.query(
+      'error_reports',
+      where: 'is_uploaded = 0 AND upload_attempts < ?',
+      whereArgs: [maxAttempts],
+      orderBy: 'created_at ASC',
+      limit: limit,
+    );
+  }
+
+  Future<void> markErrorReportsUploaded(List<int> ids) async {
+    if (ids.isEmpty) return;
+    final db = await database;
+    final placeholders = List.filled(ids.length, '?').join(',');
+    await db.rawUpdate(
+      'UPDATE error_reports SET is_uploaded = 1 WHERE id IN ($placeholders)',
+      ids,
+    );
+  }
+
+  Future<void> incrementErrorReportUploadAttempts(List<int> ids) async {
+    if (ids.isEmpty) return;
+    final db = await database;
+    final placeholders = List.filled(ids.length, '?').join(',');
+    await db.rawUpdate(
+      'UPDATE error_reports SET upload_attempts = upload_attempts + 1 WHERE id IN ($placeholders)',
+      ids,
+    );
+  }
+
+  /// Marks which scans the server confirmed it holds an attendance record for.
+  Future<void> markScansServerConfirmed(List<String> clientEventIds) async {
+    if (clientEventIds.isEmpty) return;
+    final db = await database;
+    final placeholders = List.filled(clientEventIds.length, '?').join(',');
+    await db.rawUpdate(
+      'UPDATE scan_events SET server_confirmed = 1 WHERE client_event_id IN ($placeholders)',
+      clientEventIds,
+    );
+  }
+
+  /// Client event ids this device believes it successfully synced, for
+  /// checking against what the server actually holds.
+  Future<List<String>> getSyncedClientEventIds({int limit = 200}) async {
+    final db = await database;
+    final rows = await db.query(
+      'attendance_logs',
+      columns: ['client_event_id'],
+      where: 'is_synced = 1 AND client_event_id IS NOT NULL',
+      orderBy: 'timestamp DESC',
+      limit: limit,
+    );
+    return rows
+        .map((r) => r['client_event_id'] as String?)
+        .whereType<String>()
+        .toList();
+  }
+
+  /// Re-queues logs the server turned out not to have.
+  Future<int> requeueLogsByClientEventIds(List<String> clientEventIds) async {
+    if (clientEventIds.isEmpty) return 0;
+    final db = await database;
+    final placeholders = List.filled(clientEventIds.length, '?').join(',');
+    return await db.rawUpdate(
+      'UPDATE attendance_logs SET is_synced = 0, '
+      "sync_error = 'Server had no record on reconciliation — re-queued' "
+      'WHERE client_event_id IN ($placeholders)',
+      clientEventIds,
+    );
+  }
+
+  /// Scan history for the admin screen, newest first.
+  Future<List<Map<String, dynamic>>> getScanEvents({
+    int limit = 200,
+    bool unconfirmedOnly = false,
+  }) async {
+    final db = await database;
+    return await db.query(
+      'scan_events',
+      // Thumbnails are several KB each; the list doesn't render them.
+      columns: [
+        'id',
+        'client_event_id',
+        'employee_id',
+        'employee_name',
+        'scanned_at',
+        'outcome',
+        'attendance_type',
+        'match_confidence',
+        'liveness_passed',
+        'rejection_reason',
+        'is_uploaded',
+        'server_confirmed',
+        'upload_attempts',
+        'thumbnail IS NOT NULL AS has_thumbnail',
+      ],
+      where: unconfirmedOnly ? 'server_confirmed = 0' : null,
+      orderBy: 'scanned_at DESC',
+      limit: limit,
+    );
+  }
+
+  Future<String?> getScanThumbnail(String clientEventId) async {
+    final db = await database;
+    final rows = await db.query(
+      'scan_events',
+      columns: ['thumbnail'],
+      where: 'client_event_id = ?',
+      whereArgs: [clientEventId],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first['thumbnail'] as String?;
+  }
+
+  /// Returns scan events that were rejected by the server since [since].
+  Future<List<Map<String, dynamic>>> getRecentRejections(DateTime since) async {
+    final db = await database;
+    return await db.query(
+      'scan_events',
+      columns: [
+        'client_event_id',
+        'employee_name',
+        'attendance_type',
+        'rejection_reason',
+        'scanned_at',
+      ],
+      where: "outcome = 'server_rejected' AND scanned_at >= ?",
+      whereArgs: [since.toIso8601String()],
+      orderBy: 'scanned_at DESC',
+    );
+  }
+
+  /// Drops thumbnails from old, fully-settled scans.
+  ///
+  /// The metadata row is the audit trail and stays; only the image is
+  /// reclaimed, and only once the scan is confirmed recorded and past the
+  /// window in which anyone would dispute it.
+  Future<int> trimOldScanThumbnails({int retentionDays = 60}) async {
+    final db = await database;
+    final cutoff = DateTime.now()
+        .subtract(Duration(days: retentionDays))
+        .toIso8601String();
+    return await db.rawUpdate(
+      'UPDATE scan_events SET thumbnail = NULL '
+      'WHERE thumbnail IS NOT NULL AND server_confirmed = 1 AND scanned_at < ?',
+      [cutoff],
     );
   }
 
@@ -454,6 +944,24 @@ class LocalDatabaseService {
       where: 'sync_error IS NOT NULL',
       orderBy: 'timestamp DESC',
     );
+  }
+
+  /// Raw sync columns for one attendance row, looked up by the
+  /// `client_event_id` `recordAttendance()` generated for it — backs the
+  /// punch-confirmation dialog's bounded wait for this specific punch's
+  /// outcome (see SupabaseService.getPunchSyncState).
+  Future<Map<String, dynamic>?> getLogByClientEventId(
+    String clientEventId,
+  ) async {
+    final db = await database;
+    final rows = await db.query(
+      'attendance_logs',
+      columns: ['is_synced', 'sync_error'],
+      where: 'client_event_id = ?',
+      whereArgs: [clientEventId],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first;
   }
 
   Future<int> getPendingLogsCount() async {

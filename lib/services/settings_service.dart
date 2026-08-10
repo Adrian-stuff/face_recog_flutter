@@ -1,5 +1,4 @@
 import 'package:shared_preferences/shared_preferences.dart';
-import '../config/app_config.dart';
 
 class GeofenceConfig {
   final double latitude;
@@ -32,11 +31,16 @@ class SettingsService {
     await prefs.setString(_keyWifiSSID, ssid);
   }
 
-  /// Get the target WiFi SSID (defaults to AppConfig if not set)
+  /// Get the target WiFi SSID. Empty string if never configured, which
+  /// NetworkGuard treats as "SSID check not enforced" — the same convention
+  /// already used for BSSID and the geofence below. This used to fall back
+  /// to a hardcoded AppConfig.officeWifiSSID default (a leftover value from
+  /// early development, one specific person's home WiFi name), which meant
+  /// every freshly-provisioned device was silently gated against a network
+  /// it could never actually be on until an admin configured a real one.
   Future<String> getWifiSSID() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_keyWifiSSID) ??
-        AppConfig.officeWifiSSID; // Use default from constant
+    return prefs.getString(_keyWifiSSID) ?? '';
   }
 
   /// Reset to default

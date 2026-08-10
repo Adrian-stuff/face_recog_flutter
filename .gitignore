@@ -52,3 +52,6 @@ env.*.json
 
 # Gradle build output (distinct from Flutter's root /build/)
 /android/build/
+
+# Stray device screenshots
+screen.png

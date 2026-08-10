@@ -22,6 +22,19 @@ class WifiScanException implements Exception {
   WifiScanException(this.reason);
 }
 
+/// One deduplicated nearby network from a scan, with the BSSID of whichever
+/// access point broadcasting that SSID had the strongest signal — needed
+/// because [NetworkService.getCurrentBSSID] only knows the BSSID of the
+/// network the phone happens to be connected to right now, not of a network
+/// an admin might pick from the list without connecting to it first.
+class WifiNetworkResult {
+  final String ssid;
+  final String bssid;
+  final int level;
+
+  WifiNetworkResult({required this.ssid, required this.bssid, required this.level});
+}
+
 class GeoReading {
   final double latitude;
   final double longitude;
@@ -66,7 +79,11 @@ class NetworkService {
     }
 
     try {
-      return await _networkInfo.getWifiName();
+      final name = await _networkInfo.getWifiName();
+      // Android wraps SSIDs in double-quotes (e.g. "\"MyNetwork\""); strip
+      // them so callers always see the bare name — matching what wifi_scan
+      // returns from scan results.
+      return name == null ? null : cleanSSID(name);
     } catch (e) {
       debugPrint('Failed to get Wifi Name: $e');
       return null;
@@ -95,6 +112,31 @@ class NetworkService {
   /// Android only — iOS doesn't let third-party apps list nearby access
   /// points. Throws [WifiScanException] if scanning isn't available.
   Future<List<String>> scanNearbyNetworkNames() async {
+    final results = await _scanRawResults();
+    final seen = <String>{};
+    final names = <String>[];
+    for (final ap in results) {
+      if (ap.ssid.isEmpty || !seen.add(ap.ssid)) continue;
+      names.add(ap.ssid);
+    }
+    return names;
+  }
+
+  /// Like [scanNearbyNetworkNames], but keeps each network's BSSID — for
+  /// NetworkSetupScreen, which reports whichever network the admin picks
+  /// (not necessarily the one currently connected) to the dashboard.
+  Future<List<WifiNetworkResult>> scanNearbyNetworks() async {
+    final results = await _scanRawResults();
+    final seen = <String>{};
+    final networks = <WifiNetworkResult>[];
+    for (final ap in results) {
+      if (ap.ssid.isEmpty || !seen.add(ap.ssid)) continue;
+      networks.add(WifiNetworkResult(ssid: ap.ssid, bssid: ap.bssid, level: ap.level));
+    }
+    return networks;
+  }
+
+  Future<List<WiFiAccessPoint>> _scanRawResults() async {
     final canStart = await WiFiScan.instance.canStartScan();
     if (canStart == CanStartScan.notSupported) {
       throw WifiScanException(WifiScanFailure.notSupported);
@@ -118,14 +160,7 @@ class NetworkService {
 
     final results = await WiFiScan.instance.getScannedResults();
     results.sort((a, b) => b.level.compareTo(a.level));
-
-    final seen = <String>{};
-    final names = <String>[];
-    for (final ap in results) {
-      if (ap.ssid.isEmpty || !seen.add(ap.ssid)) continue;
-      names.add(ap.ssid);
-    }
-    return names;
+    return results;
   }
 
   /// Clean SSID/BSSID by removing optional surrounding quotes

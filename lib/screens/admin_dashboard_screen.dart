@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'registration_screen.dart';
 import 'employee_list_screen.dart';
+import 'scan_history_screen.dart';
 
 class AdminDashboardScreen extends StatelessWidget {
   const AdminDashboardScreen({super.key});
@@ -35,6 +36,17 @@ class AdminDashboardScreen extends StatelessWidget {
                 () => Navigator.push(
                   context,
                   MaterialPageRoute(builder: (_) => const EmployeeListScreen()),
+                ),
+              ),
+              const SizedBox(height: 20),
+              _buildMenuButton(
+                context,
+                "Scan History",
+                Icons.fact_check,
+                Colors.teal,
+                () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const ScanHistoryScreen()),
                 ),
               ),
             ],

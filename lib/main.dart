@@ -2,7 +2,10 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'config/app_config.dart';
+import 'services/background_sync_service.dart';
 import 'services/device_reporting_service.dart';
+import 'services/provisioning_service.dart';
 import 'services/update_service.dart';
 import 'app.dart';
 
@@ -32,9 +35,22 @@ void main() async {
       };
 
       await Supabase.initialize(
-        url: 'https://gcevaajlekxtbupgptil.supabase.co',
-        anonKey: 'sb_publishable_Od7jWhMwrJ5vn-1CUOjFsw_BFrfFiyo',
+        url: AppConfig.supabaseUrl,
+        anonKey: AppConfig.supabaseAnonKey,
       );
+
+      // Must complete before the first screen builds: every authenticated
+      // request reads its key from here, and the app decides between the
+      // setup screen and the kiosk based on whether this device is bound to
+      // a company yet.
+      await ProvisioningService.instance.load();
+
+      // So attendance/scan-event uploads still eventually reach the server
+      // if the employee closes the app entirely — the foreground sync loop
+      // in SupabaseService only runs while the app process is alive. Safe to
+      // call on every cold start: registerPeriodicTask with keep policy
+      // below is a no-op if the OS already has this task scheduled.
+      BackgroundSyncService.initialize();
 
       // Trigger background Shorebird update check (fire & forget).
       // If an update is available it will be downloaded silently;

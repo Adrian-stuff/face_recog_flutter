@@ -6,35 +6,81 @@ import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../config/app_config.dart';
+import 'local_database_service.dart';
+import 'provisioning_service.dart';
 
 /// Reports mobile app errors and sync health to the web dashboard so admins
 /// can see kiosk problems (crashes, stuck syncs) without physically checking
 /// each device.
+///
+/// Error reports are written to the local database before any network
+/// attempt (see [reportError]), so a crash that happens while offline is
+/// still on the device to send once connectivity returns, instead of being
+/// lost the moment it happens. Sync-status heartbeats are not queued the
+/// same way — they're a live snapshot of the current pending/failed counts,
+/// and replaying a stale one later would just misreport what's true now.
 ///
 /// Every network call here is best-effort: reporting must never throw,
 /// block, or slow down the caller, since this is invoked from error handlers
 /// and background sync loops that must keep running regardless of whether
 /// the report itself succeeds.
 class DeviceReportingService {
-  DeviceReportingService._({http.Client? client})
-    : _client = client ?? http.Client();
+  DeviceReportingService._({http.Client? client, LocalDatabaseService? localDb})
+    : _client = client ?? http.Client(),
+      _localDb = localDb ?? LocalDatabaseService();
   static final DeviceReportingService instance = DeviceReportingService._();
 
   /// Test-only constructor for injecting a fake [http.Client] and/or
   /// [SharedPreferences] values without touching the real singleton.
   @visibleForTesting
-  factory DeviceReportingService.forTesting({required http.Client client}) =>
-      DeviceReportingService._(client: client);
+  factory DeviceReportingService.forTesting({
+    required http.Client client,
+    LocalDatabaseService? localDb,
+  }) => DeviceReportingService._(client: client, localDb: localDb);
 
   static const _deviceIdPrefKey = 'device_reporting_device_id';
   static const _requestTimeout = Duration(seconds: 8);
 
   final http.Client _client;
+  final LocalDatabaseService _localDb;
 
-  String? _deviceId;
-  String? _deviceLabel;
+  // Self-generated identity, used only for devices with no paired kiosk
+  // record at all — a legacy build-time key with no per-device row behind
+  // it (resolveKioskCompany's deviceId is null for that path server-side).
+  String? _fallbackDeviceId;
+  String? _fallbackDeviceLabel;
   String? _appVersion;
   bool _identityLoaded = false;
+
+  /// The identity this device reports itself as — evaluated fresh on every
+  /// call rather than cached, so a device that reports an error *before*
+  /// pairing and then pairs later in the same session immediately switches
+  /// over, rather than being stuck under the fallback identity until a
+  /// restart.
+  ///
+  /// Prefers the real paired kiosk_devices.id/label
+  /// (ProvisioningService.instance) once one exists, so a device showing up
+  /// in the dashboard's Mobile App Health list is the same row an admin
+  /// sees in Kiosk Configuration — not two disconnected identities for the
+  /// same physical phone. Falls back to a self-generated id for devices
+  /// with no per-device record (see above).
+  String? get deviceId {
+    final paired = ProvisioningService.instance.deviceId;
+    if (paired != null) return paired.toString();
+    return _fallbackDeviceId;
+  }
+
+  String? get deviceLabel {
+    final paired = ProvisioningService.instance.deviceLabel;
+    if (paired != null && paired.isNotEmpty) return paired;
+    return _fallbackDeviceLabel;
+  }
+
+  String? get appVersion => _appVersion;
+
+  /// Loads the device identity if it hasn't been already. Safe to call
+  /// repeatedly; the work happens once.
+  Future<void> ensureIdentity() => _ensureIdentity();
 
   Future<void> _ensureIdentity() async {
     if (_identityLoaded) return;
@@ -46,8 +92,8 @@ class DeviceReportingService {
         id = _generateId();
         await prefs.setString(_deviceIdPrefKey, id);
       }
-      _deviceId = id;
-      _deviceLabel = '${Platform.operatingSystem}-${id.substring(0, 6)}';
+      _fallbackDeviceId = id;
+      _fallbackDeviceLabel = '${Platform.operatingSystem}-${id.substring(0, 6)}';
 
       try {
         final info = await PackageInfo.fromPlatform();
@@ -71,18 +117,19 @@ class DeviceReportingService {
 
   Future<void> _post(String path, Map<String, dynamic> body) async {
     await _ensureIdentity();
-    if (_deviceId == null) return; // identity load failed; nothing to tag the report with
+    final id = deviceId;
+    if (id == null) return; // identity load failed; nothing to tag the report with
 
     await _client
         .post(
           Uri.parse('${AppConfig.nextJsBaseUrl}$path'),
           headers: {
             'Content-Type': 'application/json',
-            'x-api-key': AppConfig.mobileApiKey,
+            'x-api-key': ProvisioningService.instance.apiKey,
           },
           body: jsonEncode({
-            'deviceId': _deviceId,
-            'deviceLabel': _deviceLabel,
+            'deviceId': id,
+            'deviceLabel': deviceLabel,
             'appVersion': _appVersion,
             ...body,
           }),
@@ -92,19 +139,85 @@ class DeviceReportingService {
 
   /// Reports a single error/warning event. Failures are swallowed so a
   /// broken reporting call never masks or replaces the original error.
+  ///
+  /// Always written to the local queue first — if the device is offline
+  /// right now (a very plausible time for a crash to happen), the report
+  /// would otherwise simply be lost. The immediate upload attempt below is
+  /// just a fast path for the common online case; [syncPendingErrorReports]
+  /// is what actually guarantees delivery.
   Future<void> reportError(
     String message, {
     String level = 'error',
     String? context,
   }) async {
+    await ensureIdentity(); // so the locally-queued row has an app version too
+
+    int? localId;
+    try {
+      localId = await _localDb.insertErrorReport(
+        level: level,
+        message: message,
+        context: context,
+        appVersion: _appVersion,
+      );
+    } catch (e) {
+      debugPrint('DeviceReportingService: failed to queue error report locally: $e');
+    }
+
     try {
       await _post('/api/mobile/error-log', {
         'level': level,
         'message': message,
         'context': context,
       });
+      if (localId != null) {
+        await _localDb.markErrorReportsUploaded([localId]);
+      }
     } catch (e) {
-      debugPrint('DeviceReportingService: failed to report error: $e');
+      debugPrint(
+        'DeviceReportingService: immediate error report failed, left queued for retry: $e',
+      );
+    }
+  }
+
+  /// Uploads error reports that are still queued locally — either the
+  /// device was offline when [reportError] ran, or the immediate attempt
+  /// there failed. Called from the same background sync loop that drives
+  /// attendance log and scan event sync.
+  Future<void> syncPendingErrorReports() async {
+    List<Map<String, dynamic>> pending;
+    try {
+      pending = await _localDb.getPendingErrorReports();
+    } catch (e) {
+      debugPrint('DeviceReportingService: failed to read pending error reports: $e');
+      return;
+    }
+    if (pending.isEmpty) return;
+
+    // Counted before the attempt, not after a failure, so a request that
+    // dies mid-flight still advances the counter and can't be retried
+    // forever at full rate — same convention as scan event sync.
+    await _localDb.incrementErrorReportUploadAttempts(
+      pending.map((r) => r['id'] as int).toList(),
+    );
+
+    final uploaded = <int>[];
+    for (final report in pending) {
+      try {
+        await _post('/api/mobile/error-log', {
+          'level': report['level'],
+          'message': report['message'],
+          'context': report['context'],
+        });
+        uploaded.add(report['id'] as int);
+      } catch (e) {
+        debugPrint(
+          'DeviceReportingService: failed to sync queued error report ${report['id']}: $e',
+        );
+      }
+    }
+    if (uploaded.isNotEmpty) {
+      await _localDb.markErrorReportsUploaded(uploaded);
     }
   }
 
