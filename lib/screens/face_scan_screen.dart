@@ -477,10 +477,12 @@ class _FaceScanScreenState extends State<FaceScanScreen>
         );
 
         // Clear selection after successful recording
-        setState(() {
-          _selectedEmployee = null;
-          _nextAction = null;
-        });
+        if (mounted) {
+          setState(() {
+            _selectedEmployee = null;
+            _nextAction = null;
+          });
+        }
       }
     } catch (e, stack) {
       // A plain Exception("...") here is one of this method's own
