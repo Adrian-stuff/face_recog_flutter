@@ -1353,7 +1353,7 @@ class SupabaseService {
       }
     }
 
-    final now = DateTime.now();
+    final now = DateTime.now().toUtc();
 
     // Best-effort — capture what's true right now (not at whatever later
     // moment this record finally syncs), degrading gracefully if location
@@ -1457,7 +1457,7 @@ class SupabaseService {
     try {
       await _localDb.insertScanEvent(
         clientEventId: _uuid.v4(),
-        scannedAt: DateTime.now(),
+        scannedAt: DateTime.now().toUtc(),
         outcome: outcome,
         employeeId: employeeId,
         employeeName: employeeName,
