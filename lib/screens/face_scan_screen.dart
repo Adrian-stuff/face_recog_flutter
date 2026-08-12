@@ -685,10 +685,18 @@ class _FaceScanScreenState extends State<FaceScanScreen>
                     ),
                   );
                 } else {
+                  // One message for both "wrong password" and "correct
+                  // password, but this account doesn't administer this
+                  // kiosk's company" — matching the server, which returns the
+                  // same 403 either way. A login prompt sitting in a waiting
+                  // room shouldn't report which companies an email belongs to.
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
-                      content: Text("Invalid Credentials"),
+                      content: Text(
+                        "Invalid credentials, or this account cannot administer this kiosk.",
+                      ),
                       backgroundColor: KioskColors.error,
+                      duration: Duration(seconds: 5),
                     ),
                   );
                 }

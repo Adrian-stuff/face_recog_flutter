@@ -249,7 +249,9 @@ class _NetworkGuardState extends State<NetworkGuard>
       builder: (_) => AdminLoginDialog(),
     );
 
-    if (success == true && mounted) {
+    if (!mounted) return;
+
+    if (success == true) {
       // Proceed to Registration Screen (Admin Area)
       await Navigator.push(
         context,
@@ -257,7 +259,22 @@ class _NetworkGuardState extends State<NetworkGuard>
       );
       // When back, re-check network (maybe SSID settings changed)
       _checkNetwork();
+      return;
     }
+
+    // A rejected login used to just close the dialog with no explanation,
+    // which reads as the button being broken. This path matters more than the
+    // one on the scan screen: it's the only way past the WiFi/geofence
+    // lockout, so it's where a wrongly-refused admin will be standing.
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          "Invalid credentials, or this account cannot administer this kiosk.",
+        ),
+        backgroundColor: Colors.red,
+        duration: Duration(seconds: 5),
+      ),
+    );
   }
 
   @override

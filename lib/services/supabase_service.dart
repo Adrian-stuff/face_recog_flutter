@@ -1181,15 +1181,77 @@ class SupabaseService {
     return null;
   }
 
+  /// Signs in and confirms the account may administer *this* kiosk.
+  ///
+  /// A valid Supabase session is not sufficient on its own. Supabase Auth is
+  /// shared across the whole platform, so accepting any successful sign-in —
+  /// which is what this used to do — let one company's admin open another
+  /// company's kiosk with their own credentials, reaching the admin dashboard
+  /// and employee/face registration, and (via the NetworkGuard failure
+  /// screen's login) bypassing the WiFi/geofence lockout entirely.
+  ///
+  /// The session only proves who they are. Whether they administer the
+  /// company this device is paired to is decided by the server against
+  /// company_members, because the device cannot be trusted to enforce a
+  /// tenant boundary about itself.
   Future<bool> loginAdmin(String email, String password) async {
     try {
       final response = await _client.auth.signInWithPassword(
         email: email,
         password: password,
       );
-      return response.session != null;
+
+      final accessToken = response.session?.accessToken;
+      if (accessToken == null) return false;
+
+      final authorized = await _isAuthorizedKioskAdmin(accessToken);
+      if (!authorized) {
+        // The credentials were genuine, so without this the rejected user is
+        // left holding a live Supabase session on someone else's kiosk.
+        await _client.auth.signOut();
+      }
+      return authorized;
     } catch (e) {
       debugPrint('Error logging in admin: $e');
+      // Never leave a half-completed sign-in behind on a shared device.
+      try {
+        await _client.auth.signOut();
+      } catch (_) {}
+      return false;
+    }
+  }
+
+  /// Asks the server whether the signed-in account administers this device's
+  /// company. Fails closed: anything other than an explicit yes is a no.
+  ///
+  /// That includes the offline case. Admin access unlocks the roster and the
+  /// location-enforcement settings, so "we couldn't check" must not read as
+  /// "allowed" — and sign-in already requires connectivity anyway, so this
+  /// costs nothing that was previously available.
+  Future<bool> _isAuthorizedKioskAdmin(String accessToken) async {
+    try {
+      final response = await http
+          .post(
+            Uri.parse('${AppConfig.nextJsBaseUrl}/api/kiosk/admin-auth'),
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': ProvisioningService.instance.apiKey,
+            },
+            body: jsonEncode({'accessToken': accessToken}),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        return body['authorized'] == true;
+      }
+
+      debugPrint(
+        'Kiosk admin authorization refused: HTTP ${response.statusCode} ${response.body}',
+      );
+      return false;
+    } catch (e) {
+      debugPrint('Kiosk admin authorization check failed: $e');
       return false;
     }
   }
