@@ -262,24 +262,50 @@ class _NetworkGuardState extends State<NetworkGuard>
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
+    // The guarded child stays in the tree at all times, with the blocker
+    // painted over it — it is never swapped out for another widget.
+    //
+    // Returning a different widget when a check failed (the previous
+    // behaviour) unmounted the child and destroyed its State. On this kiosk
+    // that child is FaceScanScreen, and _checkNetwork() re-runs on every
+    // connectivity event, so a single WiFi blip mid-punch tore down the
+    // screen: the selected employee, the in-flight scan and the punch
+    // confirmation dialog all went with it. In a release build the teardown
+    // surfaced as "Null check operator used on a null value" from the
+    // setState that ran after the dialog closed, because State._element had
+    // already been nulled out. Overlaying instead means a blip that clears
+    // in a second or two is invisible to whoever is standing at the kiosk,
+    // and an employee mid-punch keeps their place.
+    return Stack(
+      children: [
+        // Kept alive and warm (camera, face model, roster) but inert while
+        // blocked — IgnorePointer plus the opaque barrier below means no
+        // punch can be started until the check passes.
+        IgnorePointer(ignoring: !_isAllowed || _isLoading, child: widget.child),
+        if (_isLoading) const _BlockerBarrier(child: Center(child: CircularProgressIndicator())),
+        if (!_isLoading && !_isAllowed) _buildBlockedOverlay(),
+      ],
+    );
+  }
 
-    if (!_isAllowed) {
-      // WiFi, when enforced, is checked first and short-circuits before GPS
-      // is ever evaluated (see computeNetworkGuardAllowed) — so these two
-      // can never both be the reason at once. Whichever is set here is the
-      // one and only culprit.
-      final wifiIsCulprit = _wifiEnforced && _wifiFailed;
-      final geoIsCulprit = _geoEnforced && _locationFailureReason != null;
-      final title = geoIsCulprit ? 'Location Check Failed' : 'Incorrect WiFi Network';
+  Widget _buildBlockedOverlay() {
+    // WiFi, when enforced, is checked first and short-circuits before GPS
+    // is ever evaluated (see computeNetworkGuardAllowed) — so these two
+    // can never both be the reason at once. Whichever is set here is the
+    // one and only culprit.
+    final wifiIsCulprit = _wifiEnforced && _wifiFailed;
+    final geoIsCulprit = _geoEnforced && _locationFailureReason != null;
+    final title = geoIsCulprit ? 'Location Check Failed' : 'Incorrect WiFi Network';
 
-      return Scaffold(
-        body: Padding(
+    return _BlockerBarrier(
+      child: Center(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24.0),
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
+            // min, not center: inside a scroll view the column is
+            // unconstrained vertically, so it must size to its content and
+            // let the surrounding Center do the centring.
+            mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
                 geoIsCulprit ? Icons.location_off : Icons.wifi_off,
@@ -335,9 +361,30 @@ class _NetworkGuardState extends State<NetworkGuard>
             ],
           ),
         ),
-      );
-    }
+      ),
+    );
+  }
+}
 
-    return widget.child;
+/// Full-screen opaque layer that covers the guarded child.
+///
+/// Opaque rather than translucent, so a blocked kiosk can't be misread as
+/// merely dimmed. The opaque [Material] is itself hit-testable and therefore
+/// swallows every touch in its area — no AbsorbPointer, which would also
+/// disable this layer's own Retry and Admin Access buttons. The child beneath
+/// is separately neutralised by the IgnorePointer in NetworkGuard.build.
+class _BlockerBarrier extends StatelessWidget {
+  final Widget child;
+
+  const _BlockerBarrier({required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: Material(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        child: SafeArea(child: child),
+      ),
+    );
   }
 }

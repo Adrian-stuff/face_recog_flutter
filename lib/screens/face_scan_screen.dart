@@ -885,47 +885,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
                   ),
                 ],
               ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: _buildActionButton(
-                      label: _nextAction == 'overtime-in'
-                          ? 'OVERTIME IN'
-                          : 'TIME IN',
-                      color: _selectedEmployee == null
-                          ? KioskColors.muted
-                          : _nextAction == 'overtime-in'
-                              ? const Color(0xFF00897B) // teal for overtime
-                              : KioskColors.success,
-                      icon: _nextAction == 'overtime-in'
-                          ? Icons.more_time_rounded
-                          : Icons.login,
-                      onPressed: _isProcessing
-                          ? null
-                          : () => _recordAttendance('time-in'),
-                    ),
-                  ),
-                  const SizedBox(width: 16),
-                  Expanded(
-                    child: _buildActionButton(
-                      label: _nextAction == 'overtime-out'
-                          ? 'OVERTIME OUT'
-                          : 'TIME OUT',
-                      color: _selectedEmployee == null
-                          ? KioskColors.muted
-                          : _nextAction == 'overtime-out'
-                              ? const Color(0xFFE65100) // deep-orange for overtime
-                              : KioskColors.warning,
-                      icon: _nextAction == 'overtime-out'
-                          ? Icons.timelapse_rounded
-                          : Icons.logout,
-                      onPressed: _isProcessing
-                          ? null
-                          : () => _recordAttendance('time-out'),
-                    ),
-                  ),
-                ],
-              ),
+              child: _buildNextActionButtons(),
             ),
           ],
         ),
@@ -1230,6 +1190,110 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       ),
       child: row,
     );
+  }
+
+  /// The punch controls, showing only the action the employee can actually
+  /// take next.
+  ///
+  /// Previously TIME IN and TIME OUT were both always live, and tapping the
+  /// wrong one cost a full liveness check and face match before
+  /// recordAttendance() rejected it ("You have already timed in today").
+  /// Worse, once a regular shift was complete the TIME IN button quietly
+  /// became an overtime-in — the single most consequential punch on the
+  /// kiosk — with nothing but a relabel to say so. Driving the controls off
+  /// [_nextAction] means the sequence time-in → time-out → overtime-in →
+  /// overtime-out is the only one reachable by tapping.
+  ///
+  /// While the next action is still loading, or if that lookup failed
+  /// (_nextAction == null), both punches stay available: guessing wrong
+  /// there would strand an employee who genuinely needs to clock out.
+  Widget _buildNextActionButtons() {
+    if (_selectedEmployee == null) {
+      return _buildActionButton(
+        label: 'SELECT AN EMPLOYEE',
+        color: KioskColors.muted,
+        icon: Icons.person_search_rounded,
+        onPressed: null,
+      );
+    }
+
+    if (_isLoadingNextAction) {
+      return _buildActionButton(
+        label: 'CHECKING STATUS…',
+        color: KioskColors.muted,
+        icon: Icons.hourglass_top_rounded,
+        onPressed: null,
+      );
+    }
+
+    switch (_nextAction) {
+      case 'time-in':
+        return _buildActionButton(
+          label: 'TIME IN',
+          color: KioskColors.success,
+          icon: Icons.login,
+          onPressed: _isProcessing ? null : () => _recordAttendance('time-in'),
+        );
+
+      case 'time-out':
+        return _buildActionButton(
+          label: 'TIME OUT',
+          color: KioskColors.warning,
+          icon: Icons.logout,
+          onPressed: _isProcessing ? null : () => _recordAttendance('time-out'),
+        );
+
+      case 'overtime-in':
+        return _buildActionButton(
+          label: 'OVERTIME IN',
+          color: const Color(0xFF00897B), // teal
+          icon: Icons.more_time_rounded,
+          onPressed: _isProcessing ? null : () => _recordAttendance('time-in'),
+        );
+
+      case 'overtime-out':
+        return _buildActionButton(
+          label: 'OVERTIME OUT',
+          color: const Color(0xFFE65100), // deep-orange
+          icon: Icons.timelapse_rounded,
+          onPressed: _isProcessing ? null : () => _recordAttendance('time-out'),
+        );
+
+      case 'done':
+        return _buildActionButton(
+          label: 'ALL DONE FOR TODAY',
+          color: KioskColors.muted,
+          icon: Icons.check_circle_outline_rounded,
+          onPressed: null,
+        );
+
+      default:
+        // Status unknown — fall back to offering both rather than locking
+        // the employee out of the kiosk entirely.
+        return Row(
+          children: [
+            Expanded(
+              child: _buildActionButton(
+                label: 'TIME IN',
+                color: KioskColors.success,
+                icon: Icons.login,
+                onPressed:
+                    _isProcessing ? null : () => _recordAttendance('time-in'),
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: _buildActionButton(
+                label: 'TIME OUT',
+                color: KioskColors.warning,
+                icon: Icons.logout,
+                onPressed:
+                    _isProcessing ? null : () => _recordAttendance('time-out'),
+              ),
+            ),
+          ],
+        );
+    }
   }
 
   Widget _buildActionButton({

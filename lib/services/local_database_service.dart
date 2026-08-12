@@ -30,7 +30,7 @@ class LocalDatabaseService {
 
     return await openDatabase(
       path,
-      version: 7,
+      version: 8,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE employees (
@@ -64,7 +64,8 @@ class LocalDatabaseService {
             is_mocked INTEGER,
             wifi_ssid TEXT,
             wifi_bssid TEXT,
-            client_event_id TEXT
+            client_event_id TEXT,
+            app_version TEXT
           )
         ''');
 
@@ -162,6 +163,15 @@ class LocalDatabaseService {
           // and scan events already are.
           await db.execute(_createErrorReportsSql);
         }
+        if (oldVersion < 8) {
+          // Stamped at punch time and carried through the offline queue, so a
+          // log that syncs days later still reports the build that created
+          // it rather than whatever the device happens to be running by then
+          // — the two diverge every time a Shorebird patch lands.
+          await db.execute(
+            'ALTER TABLE attendance_logs ADD COLUMN app_version TEXT',
+          );
+        }
       },
     );
   }
@@ -224,6 +234,53 @@ class LocalDatabaseService {
     final norm = _normalizeVector(vector);
     if (norm < 1e-10) return vector;
     return vector.map((x) => x / norm).toList();
+  }
+
+  /// Reads one face descriptor out of whatever shape the server sent it in.
+  ///
+  /// It is not always a JSON array. `face_encodings.descriptor` is a pgvector
+  /// column, and PostgreSQL has no cast from `vector` to json, so a server
+  /// building the sync payload with `json_build_object('descriptor', descriptor)`
+  /// emits the vector's *text* form — the JSON string "[0.1,0.2,...]" — rather
+  /// than a list. Every such entry used to be dropped on the floor here, which
+  /// left this cache empty for the entire roster and quietly turned offline
+  /// face verification off: with no cached vectors to score against,
+  /// verifyFaceAgainstEmployee() had to reach /api/match-face for every single
+  /// scan, so any loss of connectivity showed up at the kiosk as "face not
+  /// recognized" for everyone. The server now sends a real array, but parsing
+  /// the string form too means a kiosk keeps working against an older backend
+  /// instead of silently losing its offline path again.
+  static List<double>? _coerceDescriptor(dynamic raw) {
+    if (raw is List) {
+      if (raw.isEmpty) return null;
+      final out = <double>[];
+      for (final v in raw) {
+        if (v is num) {
+          out.add(v.toDouble());
+        } else {
+          // A mixed/garbage element means this isn't a usable vector at all;
+          // a partial descriptor would score as a stranger's face.
+          return null;
+        }
+      }
+      return out;
+    }
+
+    if (raw is String) {
+      final trimmed = raw.trim();
+      if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) return null;
+      final body = trimmed.substring(1, trimmed.length - 1).trim();
+      if (body.isEmpty) return null;
+      final out = <double>[];
+      for (final part in body.split(',')) {
+        final parsed = double.tryParse(part.trim());
+        if (parsed == null) return null;
+        out.add(parsed);
+      }
+      return out;
+    }
+
+    return null;
   }
 
   Future<void> syncEmployees(List<Map<String, dynamic>> employees) async {
@@ -372,24 +429,19 @@ class LocalDatabaseService {
             // New enriched format: [{"descriptor": [...], "is_golden": true}, ...]
             for (var item in decoded) {
               if (item is Map) {
-                final desc = item['descriptor'];
+                final desc = _coerceDescriptor(item['descriptor']);
                 final isGolden = item['is_golden'] == true;
-                if (desc is List && desc.isNotEmpty) {
-                  entries.add({
-                    'descriptor': List<double>.from(desc),
-                    'isGolden': isGolden,
-                  });
+                if (desc != null) {
+                  entries.add({'descriptor': desc, 'isGolden': isGolden});
                 }
               }
             }
-          } else if (first is List) {
+          } else if (first is List || first is String) {
             // Legacy format: [[...], [...], ...] — treat all as non-golden
             for (var v in decoded) {
-              if (v is List && v.isNotEmpty) {
-                entries.add({
-                  'descriptor': List<double>.from(v),
-                  'isGolden': false,
-                });
+              final desc = _coerceDescriptor(v);
+              if (desc != null) {
+                entries.add({'descriptor': desc, 'isGolden': false});
               }
             }
           } else if (first is num) {
@@ -483,20 +535,49 @@ class LocalDatabaseService {
 
   // --- Offline Attendance Methods ---
 
-  /// Start/end of the device's local calendar day, as the ISO strings
-  /// `timestamp` is stored and compared in throughout this table.
-  static (String, String) _todayBounds() {
+  /// A date-string window that is guaranteed to *contain* the device's local
+  /// calendar day, for use as a cheap SQL pre-filter. Callers must still pass
+  /// each row through [_isLocalToday]; this only narrows the scan.
+  ///
+  /// It deliberately over-selects by a day on each side because `timestamp`
+  /// is not stored in one single format. Rows written before the UTC fix are
+  /// naive local ISO strings ("2026-08-12T09:08:57.792"); rows written after
+  /// it are UTC ("2026-08-12T01:08:57.792Z"). Comparing either directly
+  /// against local-midnight bounds is wrong for the other, and in Manila
+  /// (UTC+8) the UTC form silently falls onto the *previous* calendar date for
+  /// anything punched before 08:00 local — which is exactly the window an
+  /// overnight overtime session ends in. A ±1 day net covers every real
+  /// timezone offset, and the precise decision happens in Dart where the
+  /// offset is actually known.
+  static (String, String) _todayScanWindow() {
     final now = DateTime.now();
-    final startOfDay = DateTime(now.year, now.month, now.day).toIso8601String();
-    final endOfDay = DateTime(
-      now.year,
-      now.month,
-      now.day,
-      23,
-      59,
-      59,
-    ).toIso8601String();
-    return (startOfDay, endOfDay);
+    final today = DateTime(now.year, now.month, now.day);
+    String dateKey(DateTime d) =>
+        '${d.year.toString().padLeft(4, '0')}-'
+        '${d.month.toString().padLeft(2, '0')}-'
+        '${d.day.toString().padLeft(2, '0')}';
+    // Every stored timestamp starts with "YYYY-MM-DD", so a plain string
+    // range over date prefixes is a valid superset filter in both formats.
+    return (
+      dateKey(today.subtract(const Duration(days: 1))),
+      dateKey(today.add(const Duration(days: 2))),
+    );
+  }
+
+  /// Whether a stored `timestamp` falls on the device's local calendar day.
+  ///
+  /// `DateTime.parse` resolves both storage formats correctly: a trailing "Z"
+  /// yields a UTC instant that `toLocal()` shifts into local time, while a
+  /// naive string is already parsed as local and passes through unchanged.
+  static bool _isLocalToday(Object? rawTimestamp) {
+    if (rawTimestamp is! String) return false;
+    final parsed = DateTime.tryParse(rawTimestamp);
+    if (parsed == null) return false;
+    final local = parsed.toLocal();
+    final now = DateTime.now();
+    return local.year == now.year &&
+        local.month == now.month &&
+        local.day == now.day;
   }
 
   /// Rows with `sync_error` set were permanently rejected by the server
@@ -506,16 +587,17 @@ class LocalDatabaseService {
   /// action for the rest of the day, since nothing else ever clears the row.
   Future<bool> hasLogForToday(int employeeId, String type) async {
     final db = await database;
-    final (startOfDay, endOfDay) = _todayBounds();
+    final (windowStart, windowEnd) = _todayScanWindow();
 
     final result = await db.query(
       'attendance_logs',
+      columns: ['timestamp'],
       where:
-          'employee_id = ? AND type = ? AND timestamp BETWEEN ? AND ? AND sync_error IS NULL',
-      whereArgs: [employeeId, type, startOfDay, endOfDay],
+          'employee_id = ? AND type = ? AND timestamp >= ? AND timestamp < ? AND sync_error IS NULL',
+      whereArgs: [employeeId, type, windowStart, windowEnd],
     );
 
-    return result.isNotEmpty;
+    return result.any((row) => _isLocalToday(row['timestamp']));
   }
 
   /// Every attendance punch recorded on this device today, newest first,
@@ -529,9 +611,9 @@ class LocalDatabaseService {
   /// correctly excluded instead of showing as a name-less mystery entry.
   Future<List<Map<String, dynamic>>> getTodayAttendance() async {
     final db = await database;
-    final (startOfDay, endOfDay) = _todayBounds();
+    final (windowStart, windowEnd) = _todayScanWindow();
 
-    return db.rawQuery(
+    final rows = await db.rawQuery(
       '''
       SELECT
         al.id,
@@ -542,11 +624,13 @@ class LocalDatabaseService {
         al.timestamp
       FROM attendance_logs al
       INNER JOIN employees e ON e.id = al.employee_id
-      WHERE al.timestamp BETWEEN ? AND ?
+      WHERE al.timestamp >= ? AND al.timestamp < ?
       ORDER BY al.timestamp DESC
       ''',
-      [startOfDay, endOfDay],
+      [windowStart, windowEnd],
     );
+
+    return rows.where((row) => _isLocalToday(row['timestamp'])).toList();
   }
 
   Future<void> insertLog(
@@ -560,6 +644,7 @@ class LocalDatabaseService {
     String? wifiSsid,
     String? wifiBssid,
     String? clientEventId,
+    String? appVersion,
   }) async {
     if (await hasLogForToday(employeeId, type)) {
       throw Exception("Already recorded on this device today ($type)");
@@ -577,6 +662,7 @@ class LocalDatabaseService {
       'wifi_ssid': wifiSsid,
       'wifi_bssid': wifiBssid,
       'client_event_id': clientEventId,
+      'app_version': appVersion,
     });
     debugPrint(
       '${isSynced ? "Online" : "Offline"} log saved for Employee $employeeId ($type)',
@@ -593,6 +679,7 @@ class LocalDatabaseService {
     String? wifiSsid,
     String? wifiBssid,
     String? clientEventId,
+    String? appVersion,
   }) async {
     await insertLog(
       employeeId,
@@ -605,6 +692,7 @@ class LocalDatabaseService {
       wifiSsid: wifiSsid,
       wifiBssid: wifiBssid,
       clientEventId: clientEventId,
+      appVersion: appVersion,
     );
   }
 

@@ -433,6 +433,10 @@ class SupabaseService {
               if (log['is_mocked'] != null) 'isMocked': log['is_mocked'] == 1,
               if (log['wifi_ssid'] != null) 'wifiSsid': log['wifi_ssid'],
               if (log['wifi_bssid'] != null) 'wifiBssid': log['wifi_bssid'],
+              // The build that recorded this punch, read off the row rather
+              // than from the running app — see insertOfflineLog. Rows queued
+              // before this column existed send nothing and stay null.
+              if (log['app_version'] != null) 'appVersion': log['app_version'],
             }),
           );
 
@@ -1231,16 +1235,53 @@ class SupabaseService {
     return body['id'] as int;
   }
 
-  /// Predicts what attendance type the next punch will record for [employeeId],
-  /// purely from the local DB — no network required. Returns one of:
+  /// What attendance type the next punch will record for [employeeId]. One of:
   /// - `'time-in'`      : not yet timed in today
   /// - `'time-out'`     : timed in but not out yet
   /// - `'overtime-in'`  : completed regular shift, overtime not started
   /// - `'overtime-out'` : overtime session is active
   /// - `'done'`         : regular shift + overtime both complete
   ///
-  /// Returns `null` only on a local DB error (should never happen).
+  /// Returns `null` if the state genuinely can't be determined, which the UI
+  /// treats as "offer both punches" rather than guessing.
+  ///
+  /// Asks the server first, because the local answer is only as good as this
+  /// device's own punch history. A reinstalled app, an employee who timed in
+  /// on a different kiosk, or an overtime session still open from *yesterday*
+  /// (which [LocalDatabaseService.hasLogForToday] cannot see, being scoped to
+  /// today) all read locally as "hasn't timed in yet". The local computation
+  /// stays as the offline fallback — it's the right answer for the common
+  /// single-kiosk case, and a kiosk with no connectivity still has to work.
   Future<String?> getEmployeeNextAction(int employeeId) async {
+    if (await isOnline) {
+      try {
+        final response = await http
+            .get(
+              Uri.parse(
+                '${AppConfig.nextJsBaseUrl}/api/attendance/status'
+                '?employeeId=$employeeId',
+              ),
+              headers: {'x-api-key': ProvisioningService.instance.apiKey},
+            )
+            .timeout(const Duration(seconds: 8));
+
+        if (response.statusCode == 200) {
+          final body = jsonDecode(response.body) as Map<String, dynamic>;
+          final action = body['nextAction'] as String?;
+          if (action != null && action.isNotEmpty) return action;
+        } else {
+          debugPrint(
+            'getEmployeeNextAction: server returned ${response.statusCode}, '
+            'falling back to local state',
+          );
+        }
+      } catch (e) {
+        // Timeout/offline/malformed response — the local answer below is a
+        // usable approximation, so this must not block the employee.
+        debugPrint('getEmployeeNextAction: server lookup failed ($e)');
+      }
+    }
+
     try {
       final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
       final hasTimedOut = await _localDb.hasLogForToday(employeeId, 'time-out');
@@ -1381,6 +1422,12 @@ class SupabaseService {
     // with a different identity.
     final clientEventId = _uuid.v4();
 
+    // The app version is loaded lazily from PackageInfo on first use. Without
+    // this, the very first punch after a cold start would race that load and
+    // be stamped null — precisely the punch most worth attributing after a
+    // bad release. Cheap and idempotent once loaded.
+    await DeviceReportingService.instance.ensureIdentity();
+
     // Written first: if the process dies between here and the attendance
     // insert, we still have proof the scan happened.
     await _localDb.insertScanEvent(
@@ -1410,6 +1457,10 @@ class SupabaseService {
       wifiSsid: ssid,
       wifiBssid: bssid,
       clientEventId: clientEventId,
+      // Captured now, not at upload time: a log that waits in the queue
+      // through a Shorebird patch would otherwise be attributed to the build
+      // that finally uploaded it rather than the one that recorded it.
+      appVersion: DeviceReportingService.instance.appVersion,
     );
 
     // Fire and forget background sync to upload the log without blocking the
