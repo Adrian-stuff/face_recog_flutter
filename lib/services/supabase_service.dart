@@ -1314,7 +1314,9 @@ class SupabaseService {
   /// today) all read locally as "hasn't timed in yet". The local computation
   /// stays as the offline fallback — it's the right answer for the common
   /// single-kiosk case, and a kiosk with no connectivity still has to work.
-  Future<String?> getEmployeeNextAction(int employeeId) async {
+  Future<({String? action, bool authoritative})> getEmployeeNextAction(
+    int employeeId,
+  ) async {
     if (await isOnline) {
       try {
         final response = await http
@@ -1325,12 +1327,20 @@ class SupabaseService {
               ),
               headers: {'x-api-key': ProvisioningService.instance.apiKey},
             )
-            .timeout(const Duration(seconds: 8));
+            // Short on purpose. Someone is standing at the kiosk waiting for
+            // a button to appear, and a kiosk on a working office LAN answers
+            // this in well under a second. The penalty for giving up early is
+            // only that the local estimate is used instead — far cheaper than
+            // making every employee wait out a long timeout on the flaky WiFi
+            // where this fallback matters most.
+            .timeout(const Duration(seconds: 3));
 
         if (response.statusCode == 200) {
           final body = jsonDecode(response.body) as Map<String, dynamic>;
           final action = body['nextAction'] as String?;
-          if (action != null && action.isNotEmpty) return action;
+          if (action != null && action.isNotEmpty) {
+            return (action: action, authoritative: true);
+          }
         } else {
           debugPrint(
             'getEmployeeNextAction: server returned ${response.statusCode}, '
@@ -1344,23 +1354,42 @@ class SupabaseService {
       }
     }
 
+    // Everything below is an estimate from this device's own punch history,
+    // so it comes back marked non-authoritative. It is right for the ordinary
+    // single-kiosk day and wrong in exactly the cases the server exists to
+    // cover: a reinstalled app, an employee who punched on another kiosk, or
+    // an overtime session still open from yesterday — all of which read here
+    // as "hasn't timed in yet". The caller must keep both punches reachable
+    // on an estimate, or an offline kiosk would refuse to let a real employee
+    // clock out.
     try {
       final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
       final hasTimedOut = await _localDb.hasLogForToday(employeeId, 'time-out');
 
-      if (!hasTimedIn) return 'time-in';
-      if (!hasTimedOut) return 'time-out';
+      String action;
+      if (!hasTimedIn) {
+        action = 'time-in';
+      } else if (!hasTimedOut) {
+        action = 'time-out';
+      } else {
+        // Completed regular shift — check overtime state
+        final hasOvertimeIn =
+            await _localDb.hasLogForToday(employeeId, 'overtime-in');
+        final hasOvertimeOut =
+            await _localDb.hasLogForToday(employeeId, 'overtime-out');
 
-      // Completed regular shift — check overtime state
-      final hasOvertimeIn = await _localDb.hasLogForToday(employeeId, 'overtime-in');
-      final hasOvertimeOut = await _localDb.hasLogForToday(employeeId, 'overtime-out');
-
-      if (!hasOvertimeIn) return 'overtime-in';
-      if (!hasOvertimeOut) return 'overtime-out';
-      return 'done';
+        if (!hasOvertimeIn) {
+          action = 'overtime-in';
+        } else if (!hasOvertimeOut) {
+          action = 'overtime-out';
+        } else {
+          action = 'done';
+        }
+      }
+      return (action: action, authoritative: false);
     } catch (e) {
       debugPrint('getEmployeeNextAction: local DB error: $e');
-      return null;
+      return (action: null, authoritative: false);
     }
   }
 

@@ -51,10 +51,17 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   Map<String, dynamic>? _selectedEmployee;
   bool _isLoadingEmployees = true;
 
-  // Next-action state — computed from local DB when an employee is selected,
-  // so the card badge and action buttons can show context before any scan.
+  // Next-action state, resolved when an employee is selected so the card badge
+  // and action buttons can show context before any scan.
   String? _nextAction; // 'time-in'|'time-out'|'overtime-in'|'overtime-out'|'done'
   bool _isLoadingNextAction = false;
+  // Whether _nextAction came from the server (which sees every kiosk and any
+  // overtime still open from yesterday) or was estimated from this device's
+  // own punch history. Only an authoritative answer narrows the kiosk to a
+  // single button; an estimate keeps both punches reachable, because the
+  // estimate is wrong in exactly the situations where an employee most needs
+  // the other one — a reinstalled app, or a shift started on another kiosk.
+  bool _nextActionIsAuthoritative = false;
 
   // Rejection notification state
   DateTime _lastRejectionCheckTime = DateTime.now().subtract(const Duration(minutes: 15));
@@ -200,6 +207,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       setState(() {
         _selectedEmployee = selected;
         _nextAction = null; // reset while loading
+        _nextActionIsAuthoritative = false;
       });
       _loadNextAction(selected['id'] as int);
     }
@@ -208,10 +216,11 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   Future<void> _loadNextAction(int employeeId) async {
     if (!mounted) return;
     setState(() => _isLoadingNextAction = true);
-    final action = await _supabaseService.getEmployeeNextAction(employeeId);
+    final result = await _supabaseService.getEmployeeNextAction(employeeId);
     if (mounted) {
       setState(() {
-        _nextAction = action;
+        _nextAction = result.action;
+        _nextActionIsAuthoritative = result.authoritative;
         _isLoadingNextAction = false;
       });
     }
@@ -481,6 +490,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
           setState(() {
             _selectedEmployee = null;
             _nextAction = null;
+            _nextActionIsAuthoritative = false;
           });
         }
       }
@@ -1212,9 +1222,11 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   /// [_nextAction] means the sequence time-in → time-out → overtime-in →
   /// overtime-out is the only one reachable by tapping.
   ///
-  /// While the next action is still loading, or if that lookup failed
-  /// (_nextAction == null), both punches stay available: guessing wrong
-  /// there would strand an employee who genuinely needs to clock out.
+  /// Narrowing to one button only happens on an authoritative answer — one
+  /// the server gave. An offline kiosk, or one whose status lookup timed out,
+  /// falls back to the local estimate and shows both punches, because acting
+  /// on a wrong guess there would strand an employee with no way to clock
+  /// out. So the kiosk stays fully usable offline; it just stops narrowing.
   Widget _buildNextActionButtons() {
     if (_selectedEmployee == null) {
       return _buildActionButton(
@@ -1238,6 +1250,13 @@ class _FaceScanScreenState extends State<FaceScanScreen>
         icon: Icons.access_time_rounded,
         onPressed: null,
       );
+    }
+
+    // Only the server sees every kiosk, and any overtime still open from
+    // yesterday. Without its answer the kiosk keeps both punches reachable
+    // rather than acting on a local guess — see _buildBothPunchButtons.
+    if (!_nextActionIsAuthoritative) {
+      return _buildBothPunchButtons();
     }
 
     switch (_nextAction) {
@@ -1284,30 +1303,41 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       default:
         // Status unknown — fall back to offering both rather than locking
         // the employee out of the kiosk entirely.
-        return Row(
-          children: [
-            Expanded(
-              child: _buildActionButton(
-                label: 'TIME IN',
-                color: KioskColors.success,
-                icon: Icons.login,
-                onPressed:
-                    _isProcessing ? null : () => _recordAttendance('time-in'),
-              ),
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: _buildActionButton(
-                label: 'TIME OUT',
-                color: KioskColors.warning,
-                icon: Icons.logout,
-                onPressed:
-                    _isProcessing ? null : () => _recordAttendance('time-out'),
-              ),
-            ),
-          ],
-        );
+        return _buildBothPunchButtons();
     }
+  }
+
+  /// Both punches side by side, used whenever the kiosk isn't certain which
+  /// one comes next.
+  ///
+  /// This is the offline shape. The local estimate can't see a shift started
+  /// on another kiosk, a roster that arrived after a reinstall, or an overtime
+  /// session still open from yesterday — all of which look like "hasn't timed
+  /// in yet" here. Narrowing to one button on a guess that wrong would leave a
+  /// real employee standing at a kiosk with no way to clock out, which is a
+  /// far worse failure than showing one button too many.
+  Widget _buildBothPunchButtons() {
+    return Row(
+      children: [
+        Expanded(
+          child: _buildActionButton(
+            label: 'TIME IN',
+            color: KioskColors.success,
+            icon: Icons.login,
+            onPressed: _isProcessing ? null : () => _recordAttendance('time-in'),
+          ),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: _buildActionButton(
+            label: 'TIME OUT',
+            color: KioskColors.warning,
+            icon: Icons.logout,
+            onPressed: _isProcessing ? null : () => _recordAttendance('time-out'),
+          ),
+        ),
+      ],
+    );
   }
 
   Widget _buildActionButton({
