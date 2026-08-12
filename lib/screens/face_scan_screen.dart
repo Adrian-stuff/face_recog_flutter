@@ -1221,7 +1221,13 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       return _buildActionButton(
         label: 'CHECKING STATUS…',
         color: KioskColors.muted,
-        icon: Icons.hourglass_top_rounded,
+        // access_time rather than an hourglass, which would read better here
+        // but is not in the shipped icon font. Flutter tree-shakes
+        // MaterialIcons down to the glyphs a build actually references, and
+        // Shorebird patches carry code only — never assets. Referencing a
+        // glyph the installed release didn't bundle renders an empty box on
+        // the kiosk. Any new icon has to wait for a full release.
+        icon: Icons.access_time_rounded,
         onPressed: null,
       );
     }
