@@ -7,6 +7,36 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:mobile_app/services/device_reporting_service.dart';
+import 'package:mobile_app/services/local_database_service.dart';
+
+/// Records what the reporting service does to the local queue.
+///
+/// noSuchMethod stands in for the rest of LocalDatabaseService's surface so
+/// this stays a fake of the two calls that matter here, rather than a
+/// reimplementation of the whole class.
+class _FakeLocalDb implements LocalDatabaseService {
+  final List<int> markedUploaded = [];
+  int inserted = 0;
+
+  @override
+  Future<int> insertErrorReport({
+    required String level,
+    required String message,
+    String? context,
+    String? appVersion,
+  }) async {
+    inserted += 1;
+    return inserted;
+  }
+
+  @override
+  Future<void> markErrorReportsUploaded(List<int> ids) async {
+    markedUploaded.addAll(ids);
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -84,6 +114,37 @@ void main() {
     expect(captured, hasLength(1));
     final body = jsonDecode(captured[0].body) as Map<String, dynamic>;
     expect(body['deviceId'], isNotEmpty);
+  });
+
+  // The bug: package:http only throws on transport failures, so a 401/403/500
+  // came back as an ordinary Response and _post returned normally. reportError
+  // took that as proof of delivery and deleted the queued row — silently
+  // destroying exactly the reports sent while the kiosk API key was rejected.
+  test('a report the server rejects stays queued instead of being marked sent', () async {
+    for (final status in [401, 403, 429, 500]) {
+      final db = _FakeLocalDb();
+      final client = MockClient((request) async => http.Response('nope', status));
+      final service = DeviceReportingService.forTesting(client: client, localDb: db);
+
+      await service.reportError('something broke');
+
+      expect(db.inserted, 1, reason: 'HTTP $status: report should be queued locally');
+      expect(
+        db.markedUploaded,
+        isEmpty,
+        reason: 'HTTP $status: a rejected report must not be recorded as delivered',
+      );
+    }
+  });
+
+  test('a report the server accepts is marked delivered', () async {
+    final db = _FakeLocalDb();
+    final client = MockClient((request) async => http.Response('{"success":true}', 200));
+    final service = DeviceReportingService.forTesting(client: client, localDb: db);
+
+    await service.reportError('something broke');
+
+    expect(db.markedUploaded, [1]);
   });
 
   test('network failures are swallowed and never thrown to the caller', () async {

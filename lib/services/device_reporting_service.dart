@@ -115,12 +115,31 @@ class DeviceReportingService {
     return List.generate(16, (_) => rand.nextInt(16).toRadixString(16)).join();
   }
 
+  /// Sends one report, throwing unless the server actually accepted it.
+  ///
+  /// Both callers treat "returned without throwing" as proof of delivery and
+  /// then mark the queued row uploaded, so anything that returns quietly here
+  /// destroys the report. Two paths used to do exactly that:
+  ///
+  ///   * package:http only throws on transport failures — a 401, 403, 429 or
+  ///     500 comes back as an ordinary Response. Every rejected report was
+  ///     therefore recorded as delivered and dropped. That is not theoretical:
+  ///     when the shared kiosk API key was retired, every kiosk endpoint
+  ///     started answering 401, and reportError()'s immediate send runs with
+  ///     no reachability gate in front of it — so the crash reports from
+  ///     precisely that window were the ones being thrown away.
+  ///   * a missing device identity returned early, silently.
+  ///
+  /// Throwing instead leaves the row queued for [syncPendingErrorReports],
+  /// which is the only thing that actually guarantees delivery.
   Future<void> _post(String path, Map<String, dynamic> body) async {
     await _ensureIdentity();
     final id = deviceId;
-    if (id == null) return; // identity load failed; nothing to tag the report with
+    if (id == null) {
+      throw StateError('Device identity unavailable; cannot attribute report');
+    }
 
-    await _client
+    final response = await _client
         .post(
           Uri.parse('${AppConfig.nextJsBaseUrl}$path'),
           headers: {
@@ -135,6 +154,12 @@ class DeviceReportingService {
           }),
         )
         .timeout(_requestTimeout);
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw HttpException(
+        'Report rejected: HTTP ${response.statusCode} ${response.body}',
+      );
+    }
   }
 
   /// Reports a single error/warning event. Failures are swallowed so a
