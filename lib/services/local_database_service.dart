@@ -62,6 +62,96 @@ class LocalDatabaseService {
     await db.execute('ALTER TABLE $table ADD COLUMN $column $type');
   }
 
+  /// Every column each table is expected to have, once all migrations have
+  /// run. The single source of truth that [_reconcileSchema] enforces.
+  ///
+  /// Primary keys and NOT NULL columns are omitted deliberately: this drives
+  /// `ALTER TABLE ADD COLUMN`, which SQLite will not accept for a NOT NULL
+  /// column without a default. Those only ever come from CREATE TABLE, so
+  /// they cannot be missing from a table that exists at all.
+  static const Map<String, Map<String, String>> _expectedColumns = {
+    'employees': {
+      'first_name': 'TEXT',
+      'last_name': 'TEXT',
+      'position': 'TEXT',
+      'image_url': 'TEXT',
+      'local_image_path': 'TEXT',
+      'face_features': 'TEXT',
+    },
+    'attendance_logs': {
+      'employee_id': 'INTEGER',
+      'timestamp': 'TEXT',
+      'type': 'TEXT',
+      'is_synced': 'INTEGER DEFAULT 0',
+      'sync_error': 'TEXT',
+      'lat': 'REAL',
+      'lng': 'REAL',
+      'is_mocked': 'INTEGER',
+      'wifi_ssid': 'TEXT',
+      'wifi_bssid': 'TEXT',
+      'client_event_id': 'TEXT',
+      'app_version': 'TEXT',
+    },
+    'offline_encodings': {
+      'employee_id': 'INTEGER',
+      'descriptor': 'TEXT',
+      'is_golden': 'INTEGER DEFAULT 0',
+      'created_at': 'TEXT',
+      'is_synced': 'INTEGER DEFAULT 0',
+      'sync_error': 'TEXT',
+    },
+  };
+
+  /// Columns in [expected] that [actual] doesn't have.
+  ///
+  /// Split out as a pure function so the reconciliation rule is unit-testable
+  /// without a database engine.
+  static List<MapEntry<String, String>> missingColumns(
+    Set<String> actual,
+    Map<String, String> expected,
+  ) {
+    return expected.entries.where((e) => !actual.contains(e.key)).toList();
+  }
+
+  /// Brings the real schema up to [_expectedColumns], whatever route the
+  /// database took to get here.
+  ///
+  /// Runs on *every* open, not just on a version bump, because `user_version`
+  /// has repeatedly turned out to be an unreliable description of what a
+  /// device actually has. Two ways that happened here, both of which reached
+  /// production:
+  ///
+  ///   * onCreate drifted from the cumulative onUpgrade result, so fresh
+  ///     installs came up missing `client_event_id` and every attendance
+  ///     write failed with "no column named client_event_id".
+  ///   * an onUpgrade threw partway, and because sqflite wraps it in a
+  ///     transaction the version was never advanced — so the same broken
+  ///     upgrade was retried on every launch, forever, and the kiosk could
+  ///     not open its database at all.
+  ///
+  /// Reconciling against a declared target makes both self-correcting: the
+  /// device converges on the right schema on the next launch instead of
+  /// needing a patch. It is also cheap — a handful of PRAGMA reads.
+  static Future<void> _reconcileSchema(Database db) async {
+    for (final table in _expectedColumns.entries) {
+      // A table that doesn't exist isn't reconciled here; creating it is
+      // onCreate's job, and inventing one would mask a real problem.
+      if (!await _tableExists(db, table.key)) continue;
+
+      final info = await db.rawQuery('PRAGMA table_info(${table.key})');
+      final actual = info.map((c) => c['name'] as String).toSet();
+
+      for (final column in missingColumns(actual, table.value)) {
+        debugPrint(
+          'Schema reconcile: adding missing ${table.key}.${column.key}',
+        );
+        await db.execute(
+          'ALTER TABLE ${table.key} ADD COLUMN ${column.key} ${column.value}',
+        );
+      }
+    }
+  }
+
   Future<Database> _initDatabase() async {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, 'face_attendance.db');
@@ -77,6 +167,11 @@ class LocalDatabaseService {
       // onDatabaseDowngradeDelete, which would throw away every queued punch
       // that hadn't synced yet.
       onDowngrade: (db, oldVersion, newVersion) async {},
+      // Last line of defence, after whichever of onCreate/onUpgrade/neither
+      // ran. See _reconcileSchema: user_version has proven an unreliable
+      // description of what a device actually has, so the schema is verified
+      // against a declared target on every open rather than trusted.
+      onOpen: _reconcileSchema,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE employees (

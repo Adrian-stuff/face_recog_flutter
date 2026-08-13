@@ -1314,44 +1314,49 @@ class SupabaseService {
   /// today) all read locally as "hasn't timed in yet". The local computation
   /// stays as the offline fallback — it's the right answer for the common
   /// single-kiosk case, and a kiosk with no connectivity still has to work.
+  /// The server's verdict on what this employee should punch next, or null if
+  /// it couldn't be reached. Authoritative when it answers: it sees every
+  /// kiosk and any overtime session still open from a previous day.
+  ///
+  /// Short timeout on purpose. Someone is standing at the kiosk waiting, and
+  /// a working office LAN answers this in well under a second. Giving up
+  /// early only costs a fallback to the local estimate — far cheaper than
+  /// making every employee wait out a long timeout on the flaky WiFi where
+  /// this matters most.
+  Future<String?> _serverNextAction(int employeeId) async {
+    if (!await isOnline) return null;
+    try {
+      final response = await http
+          .get(
+            Uri.parse(
+              '${AppConfig.nextJsBaseUrl}/api/attendance/status'
+              '?employeeId=$employeeId',
+            ),
+            headers: {'x-api-key': ProvisioningService.instance.apiKey},
+          )
+          .timeout(const Duration(seconds: 3));
+
+      if (response.statusCode == 200) {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        final action = body['nextAction'] as String?;
+        if (action != null && action.isNotEmpty) return action;
+      } else {
+        debugPrint(
+          'nextAction: server returned ${response.statusCode}, using local state',
+        );
+      }
+    } catch (e) {
+      debugPrint('nextAction: server lookup failed ($e)');
+    }
+    return null;
+  }
+
   Future<({String? action, bool authoritative})> getEmployeeNextAction(
     int employeeId,
   ) async {
-    if (await isOnline) {
-      try {
-        final response = await http
-            .get(
-              Uri.parse(
-                '${AppConfig.nextJsBaseUrl}/api/attendance/status'
-                '?employeeId=$employeeId',
-              ),
-              headers: {'x-api-key': ProvisioningService.instance.apiKey},
-            )
-            // Short on purpose. Someone is standing at the kiosk waiting for
-            // a button to appear, and a kiosk on a working office LAN answers
-            // this in well under a second. The penalty for giving up early is
-            // only that the local estimate is used instead — far cheaper than
-            // making every employee wait out a long timeout on the flaky WiFi
-            // where this fallback matters most.
-            .timeout(const Duration(seconds: 3));
-
-        if (response.statusCode == 200) {
-          final body = jsonDecode(response.body) as Map<String, dynamic>;
-          final action = body['nextAction'] as String?;
-          if (action != null && action.isNotEmpty) {
-            return (action: action, authoritative: true);
-          }
-        } else {
-          debugPrint(
-            'getEmployeeNextAction: server returned ${response.statusCode}, '
-            'falling back to local state',
-          );
-        }
-      } catch (e) {
-        // Timeout/offline/malformed response — the local answer below is a
-        // usable approximation, so this must not block the employee.
-        debugPrint('getEmployeeNextAction: server lookup failed ($e)');
-      }
+    final serverAction = await _serverNextAction(employeeId);
+    if (serverAction != null) {
+      return (action: serverAction, authoritative: true);
     }
 
     // Everything below is an estimate from this device's own punch history,
@@ -1473,9 +1478,24 @@ class SupabaseService {
             "You have already completed an overtime session today.",
           );
         } else {
-          throw Exception(
-            "You have already timed out and have no active overtime session.",
-          );
+          // Local history says there's no session to close — but it is only
+          // this device's view, and it is wrong in the case that matters
+          // most. hasLogForToday() ignores rows carrying a sync_error, so a
+          // single rejected overtime-in upload erases the session from the
+          // device's memory while the server keeps it open. That is not
+          // hypothetical: overtime punches had no idempotency key, so a
+          // retried upload was refused as a duplicate, and the employee was
+          // then locked out of the overtime-out permanently.
+          //
+          // The server holds the real answer, so ask it before refusing.
+          final serverAction = await _serverNextAction(employeeId);
+          if (serverAction == 'overtime-out') {
+            effectiveType = 'overtime-out';
+          } else {
+            throw Exception(
+              "You have already timed out and have no active overtime session.",
+            );
+          }
         }
       } else if (!hasTimedIn) {
         final online = await isOnline;
