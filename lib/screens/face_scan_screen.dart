@@ -11,7 +11,9 @@ import '../services/permissions_service.dart';
 import '../services/scan_evidence_service.dart';
 import '../services/sound_service.dart';
 import '../services/supabase_service.dart';
+import '../services/update_service.dart';
 import '../widgets/real_time_clock.dart';
+import '../widgets/status_chip.dart';
 import '../widgets/weather_widget.dart';
 import '../widgets/searchable_employee_selector.dart';
 import '../widgets/punch_confirmation_dialog.dart';
@@ -39,6 +41,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   SyncStatus? _syncStatus;
   Timer? _syncStatusTimer;
+  Timer? _updateCheckTimer;
   List<KioskPermission> _missingPermissions = [];
 
   // Calendar state
@@ -81,6 +84,21 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       const Duration(seconds: 30),
       (_) => _refreshSyncStatus(),
     );
+
+    // Release/patch numbers for the version dialog. Read once — they only
+    // change across a restart, which rebuilds this screen anyway.
+    UpdateService.instance.loadVersionInfo();
+
+    // A kiosk runs for weeks without anyone touching it, so a check that only
+    // happened at launch would leave it sitting on stale code indefinitely —
+    // which is exactly how this fleet ended up running builds nobody could
+    // identify. Half-hourly is far below Shorebird's rate limits and keeps
+    // "Up to date" an honest claim rather than a stale one.
+    UpdateService.instance.checkAndUpdate();
+    _updateCheckTimer = Timer.periodic(
+      const Duration(minutes: 30),
+      (_) => UpdateService.instance.checkAndUpdate(),
+    );
   }
 
   @override
@@ -92,6 +110,9 @@ class _FaceScanScreenState extends State<FaceScanScreen>
     // revoking) something there.
     if (state == AppLifecycleState.resumed) {
       _checkPermissions();
+      // Coming back from the background is the cheapest moment to notice a
+      // patch published while the kiosk was idle.
+      UpdateService.instance.checkAndUpdate();
     }
   }
 
@@ -553,6 +574,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
     WidgetsBinding.instance.removeObserver(this);
     _connectivitySubscription?.cancel();
     _syncStatusTimer?.cancel();
+    _updateCheckTimer?.cancel();
     super.dispose();
   }
 
@@ -745,50 +767,28 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      // The bar carries identity and the two destinations, nothing else.
+      // Everything that reports *state* moved to the strip below it: with the
+      // connectivity pill, sync badge, permission badge and two icon buttons
+      // all competing for the right edge, a company name of any real length
+      // was squeezed to the point of truncation, and each badge had been
+      // styled slightly differently from the last.
       appBar: AppBar(
+        titleSpacing: 16,
         title: ValueListenableBuilder<String?>(
           valueListenable: _supabaseService.companyName,
           builder: (context, name, _) {
-            return Text(name != null ? '$name — Face Attendance' : "Face Attendance");
+            // "Face Attendance" is dropped from the title — it's the only
+            // thing this kiosk does, so it spent its characters saying
+            // nothing and pushed the company name into an ellipsis.
+            return Text(
+              name ?? 'Face Attendance',
+              overflow: TextOverflow.ellipsis,
+            );
           },
         ),
-        centerTitle: true,
+        centerTitle: false,
         actions: [
-          // Internet Status Indicator
-          Container(
-            margin: const EdgeInsets.symmetric(horizontal: 8),
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: _isConnected
-                  ? KioskColors.success.withValues(alpha: 0.1)
-                  : KioskColors.error.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: _isConnected ? KioskColors.success : KioskColors.error,
-                width: 1,
-              ),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  _isConnected ? Icons.wifi : Icons.wifi_off,
-                  color: _isConnected ? KioskColors.success : KioskColors.error,
-                  size: 16,
-                ),
-                const SizedBox(width: 4),
-                Text(
-                  _isConnected ? "Online" : "Offline",
-                  style: TextStyle(
-                    color: _isConnected ? KioskColors.success : KioskColors.error,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 12,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (_syncStatus?.hasIssues == true) _buildSyncStatusBadge(),
-          if (_missingPermissions.isNotEmpty) _buildPermissionAlertBadge(),
           IconButton(
             tooltip: "Today's attendance",
             icon: const Icon(Icons.groups),
@@ -797,10 +797,16 @@ class _FaceScanScreenState extends State<FaceScanScreen>
             ),
           ),
           IconButton(
+            tooltip: 'Admin',
             icon: const Icon(Icons.admin_panel_settings),
             onPressed: _showAdminLoginDialog,
           ),
+          const SizedBox(width: 4),
         ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(44),
+          child: _buildStatusStrip(),
+        ),
       ),
       body: SafeArea(
         child: Column(
@@ -1371,46 +1377,92 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   /// device isn't invisible until the server's 7-day sync window expires
   /// and records start silently disappearing. Red (failed) takes priority
   /// over amber (still pending, will keep retrying).
-  Widget _buildSyncStatusBadge() {
-    final status = _syncStatus!;
-    final hasFailed = status.failedCount > 0;
-    final color = hasFailed ? KioskColors.error : KioskColors.warning;
-    final label = hasFailed
-        ? '${status.failedCount} sync issue${status.failedCount == 1 ? '' : 's'}'
-        : '${status.pendingCount} pending';
-
-    return Padding(
-      padding: const EdgeInsets.only(right: 4),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: () => _showSyncStatusDialog(status),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: color.withOpacity(0.1),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: color, width: 1),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                hasFailed ? Icons.error_outline : Icons.cloud_upload_outlined,
-                color: color,
-                size: 16,
-              ),
-              const SizedBox(width: 4),
-              Text(
-                label,
-                style: TextStyle(
-                  color: color,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
-                ),
-              ),
-            ],
-          ),
+  /// The header's state row: connectivity, updates, sync backlog, permissions.
+  ///
+  /// Horizontally scrollable rather than wrapping or eliding. Which chips are
+  /// present depends on runtime conditions, so the row's width isn't knowable
+  /// at design time; scrolling means a narrow kiosk in portrait degrades to a
+  /// swipe instead of a RenderFlex overflow.
+  Widget _buildStatusStrip() {
+    return Container(
+      height: 44,
+      width: double.infinity,
+      decoration: const BoxDecoration(
+        color: KioskColors.base200,
+        border: Border(
+          top: BorderSide(color: KioskColors.hairline),
+          bottom: BorderSide(color: KioskColors.hairline),
         ),
       ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: Row(
+          children: [
+            StatusChip(
+              icon: _isConnected ? Icons.wifi : Icons.wifi_off,
+              label: _isConnected ? 'Online' : 'Offline',
+              color: _isConnected ? KioskColors.success : KioskColors.error,
+            ),
+            _buildUpdateChip(),
+            if (_syncStatus?.hasIssues == true) _buildSyncStatusChip(),
+            if (_missingPermissions.isNotEmpty) _buildPermissionAlertChip(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Update status, tappable for the exact release and patch it's running.
+  Widget _buildUpdateChip() {
+    return ValueListenableBuilder<AppUpdateState>(
+      valueListenable: UpdateService.instance.state,
+      builder: (context, state, _) {
+        // A debug or profile build has no Shorebird updater behind it, so
+        // there is no honest status to show — better an absent chip than one
+        // permanently claiming "up to date".
+        if (state == AppUpdateState.unavailable) return const SizedBox.shrink();
+
+        final (label, color, icon, busy) = switch (state) {
+          AppUpdateState.checking => (
+              'Checking…', KioskColors.muted, Icons.sync_rounded, true,
+            ),
+          AppUpdateState.downloading => (
+              'Updating…', KioskColors.info, Icons.cloud_sync, true,
+            ),
+          AppUpdateState.readyToRestart => (
+              'Restart to update', KioskColors.warning, Icons.system_update, false,
+            ),
+          AppUpdateState.upToDate => (
+              'Up to date', KioskColors.success, Icons.check_circle_outline_rounded, false,
+            ),
+          AppUpdateState.failed => (
+              'Update failed', KioskColors.error, Icons.error_outline_rounded, false,
+            ),
+          _ => ('Checking…', KioskColors.muted, Icons.sync_rounded, true),
+        };
+
+        return StatusChip(
+          icon: icon,
+          label: label,
+          color: color,
+          busy: busy,
+          onTap: _showUpdateDialog,
+        );
+      },
+    );
+  }
+
+  Widget _buildSyncStatusChip() {
+    final status = _syncStatus!;
+    final hasFailed = status.failedCount > 0;
+    return StatusChip(
+      icon: hasFailed ? Icons.error_outline : Icons.cloud_upload_outlined,
+      label: hasFailed
+          ? '${status.failedCount} sync issue${status.failedCount == 1 ? '' : 's'}'
+          : '${status.pendingCount} pending',
+      color: hasFailed ? KioskColors.error : KioskColors.warning,
+      onTap: () => _showSyncStatusDialog(status),
     );
   }
 
@@ -1586,43 +1638,98 @@ class _FaceScanScreenState extends State<FaceScanScreen>
     );
   }
 
-  Widget _buildPermissionAlertBadge() {
+  Widget _buildPermissionAlertChip() {
     final hasCritical = _missingPermissions.any((p) => p.critical);
-    final color = hasCritical ? KioskColors.error : KioskColors.warning;
-    final label = _missingPermissions.length == 1
-        ? '${_missingPermissions.first.label} off'
-        : '${_missingPermissions.length} permissions off';
+    return StatusChip(
+      icon: Icons.no_accounts,
+      label: _missingPermissions.length == 1
+          ? '${_missingPermissions.first.label} off'
+          : '${_missingPermissions.length} permissions off',
+      color: hasCritical ? KioskColors.error : KioskColors.warning,
+      onTap: _showPermissionDialog,
+    );
+  }
 
-    return Padding(
-      padding: const EdgeInsets.only(right: 4),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: _showPermissionDialog,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: color.withValues(alpha: 0.1),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: color, width: 1),
-          ),
-          child: Row(
-            children: [
-              Icon(Icons.no_accounts, color: color, size: 16),
-              const SizedBox(width: 4),
-              Text(
-                label,
-                style: TextStyle(
-                  color: color,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
+  /// Exactly what code this device is running, and how current it is.
+  ///
+  /// Worth a dialog rather than a tooltip: when a fleet misbehaves, the first
+  /// question is always "which build is that kiosk actually on", and until now
+  /// answering it meant cross-referencing the dashboard. A patch number is
+  /// also not the same as a release version — Shorebird replaces Dart code
+  /// underneath a fixed release, so both have to be shown to identify a build.
+  Future<void> _showUpdateDialog() async {
+    final service = UpdateService.instance;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('App version'),
+        content: ValueListenableBuilder<AppUpdateState>(
+          valueListenable: service.state,
+          builder: (context, state, _) {
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                VersionRow(
+                  label: 'Release',
+                  value: service.releaseVersion.value ?? 'Unknown',
                 ),
-              ),
-            ],
-          ),
+                const SizedBox(height: 8),
+                VersionRow(
+                  label: 'Patch',
+                  // No patch installed means running the release as built,
+                  // which is a real state and not an error.
+                  value: service.currentPatch.value?.toString() ?? 'None (base release)',
+                ),
+                const SizedBox(height: 8),
+                VersionRow(label: 'Status', value: _updateStatusText(state)),
+                if (state == AppUpdateState.readyToRestart) ...[
+                  const SizedBox(height: 16),
+                  Text(
+                    'Close and reopen the app to finish updating.',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: KioskColors.warning,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ],
+            );
+          },
         ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+          ValueListenableBuilder<AppUpdateState>(
+            valueListenable: service.state,
+            builder: (context, state, _) {
+              final busy = state == AppUpdateState.checking ||
+                  state == AppUpdateState.downloading;
+              return TextButton.icon(
+                onPressed: busy ? null : () => service.checkAndUpdate(),
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('Check now'),
+              );
+            },
+          ),
+        ],
       ),
     );
   }
+
+  String _updateStatusText(AppUpdateState state) => switch (state) {
+        AppUpdateState.checking => 'Checking for updates…',
+        AppUpdateState.downloading => 'Downloading update…',
+        AppUpdateState.readyToRestart => 'Update ready — restart required',
+        AppUpdateState.upToDate => 'Up to date',
+        AppUpdateState.failed => 'Last update check failed',
+        AppUpdateState.unavailable => 'Updates not available in this build',
+        AppUpdateState.unknown => 'Not checked yet',
+      };
 
   Future<void> _showPermissionDialog() async {
     await showDialog<void>(
