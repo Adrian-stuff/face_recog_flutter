@@ -24,6 +24,44 @@ class LocalDatabaseService {
     return _database!;
   }
 
+  /// Whether [table] exists at all. A migration that ALTERs a table which was
+  /// never created would fail just as hard as adding a duplicate column.
+  static Future<bool> _tableExists(Database db, String table) async {
+    final rows = await db.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+      [table],
+    );
+    return rows.isNotEmpty;
+  }
+
+  /// Adds a column only if it isn't already there.
+  ///
+  /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and every migration below used
+  /// a bare ALTER. That assumes a database's recorded `user_version` always
+  /// matches its actual shape — and when it doesn't, the failure is total and
+  /// permanent: sqflite runs onUpgrade in a transaction, so one duplicate
+  /// column rolls the whole thing back, `user_version` never advances, and the
+  /// identical upgrade is retried on every single open. The database then
+  /// never opens again, which takes down attendance recording, sync and the
+  /// offline face cache together, since all of them go through [database].
+  ///
+  /// That is not hypothetical — a kiosk in the field hit exactly this and sat
+  /// in the retry loop until it was patched. Checking first means a device
+  /// whose schema has drifted from its version number repairs itself on the
+  /// next open instead of being bricked by the mismatch.
+  static Future<void> _addColumnIfMissing(
+    Database db,
+    String table,
+    String column,
+    String type,
+  ) async {
+    if (!await _tableExists(db, table)) return;
+    final columns = await db.rawQuery('PRAGMA table_info($table)');
+    final exists = columns.any((c) => c['name'] == column);
+    if (exists) return;
+    await db.execute('ALTER TABLE $table ADD COLUMN $column $type');
+  }
+
   Future<Database> _initDatabase() async {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, 'face_attendance.db');
@@ -31,6 +69,14 @@ class LocalDatabaseService {
     return await openDatabase(
       path,
       version: 8,
+      // A Shorebird rollback puts older code in front of a newer database.
+      // sqflite's default behaviour there is to throw, which would brick the
+      // kiosk exactly when someone is rolling back to *un*-brick it. The
+      // schema only ever grows, so an older build simply ignores the columns
+      // it doesn't know about — doing nothing is safe, and far safer than
+      // onDatabaseDowngradeDelete, which would throw away every queued punch
+      // that hadn't synced yet.
+      onDowngrade: (db, oldVersion, newVersion) async {},
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE employees (
@@ -87,7 +133,7 @@ class LocalDatabaseService {
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
-          await db.execute('ALTER TABLE employees ADD COLUMN image_url TEXT');
+          await _addColumnIfMissing(db, 'employees', 'image_url', 'TEXT');
           await db.execute('''
             CREATE TABLE IF NOT EXISTS offline_encodings (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,8 +146,8 @@ class LocalDatabaseService {
           ''');
         }
         if (oldVersion < 3) {
-          await db.execute(
-            'ALTER TABLE employees ADD COLUMN local_image_path TEXT',
+          await _addColumnIfMissing(
+            db, 'employees', 'local_image_path', 'TEXT',
           );
         }
         if (oldVersion < 4) {
@@ -110,11 +156,11 @@ class LocalDatabaseService {
           // stop retrying — indistinguishable from a real success, so the
           // failure was invisible. sync_error now records why, so failures
           // stay visible instead of silently vanishing from the queue.
-          await db.execute(
-            'ALTER TABLE attendance_logs ADD COLUMN sync_error TEXT',
+          await _addColumnIfMissing(
+            db, 'attendance_logs', 'sync_error', 'TEXT',
           );
-          await db.execute(
-            'ALTER TABLE offline_encodings ADD COLUMN sync_error TEXT',
+          await _addColumnIfMissing(
+            db, 'offline_encodings', 'sync_error', 'TEXT',
           );
         }
         if (oldVersion < 5) {
@@ -124,16 +170,16 @@ class LocalDatabaseService {
           // them per-log lets a later sync still report what was true at
           // the moment of the action, not whatever the device's state is
           // when it finally gets a connection.
-          await db.execute('ALTER TABLE attendance_logs ADD COLUMN lat REAL');
-          await db.execute('ALTER TABLE attendance_logs ADD COLUMN lng REAL');
-          await db.execute(
-            'ALTER TABLE attendance_logs ADD COLUMN is_mocked INTEGER',
+          await _addColumnIfMissing(db, 'attendance_logs', 'lat', 'REAL');
+          await _addColumnIfMissing(db, 'attendance_logs', 'lng', 'REAL');
+          await _addColumnIfMissing(
+            db, 'attendance_logs', 'is_mocked', 'INTEGER',
           );
-          await db.execute(
-            'ALTER TABLE attendance_logs ADD COLUMN wifi_ssid TEXT',
+          await _addColumnIfMissing(
+            db, 'attendance_logs', 'wifi_ssid', 'TEXT',
           );
-          await db.execute(
-            'ALTER TABLE attendance_logs ADD COLUMN wifi_bssid TEXT',
+          await _addColumnIfMissing(
+            db, 'attendance_logs', 'wifi_bssid', 'TEXT',
           );
         }
         if (oldVersion < 6) {
@@ -144,8 +190,8 @@ class LocalDatabaseService {
           // a retry after a lost response reconciles to the original server
           // row rather than tripping the one-per-day unique constraint and
           // being recorded as a permanent failure.
-          await db.execute(
-            'ALTER TABLE attendance_logs ADD COLUMN client_event_id TEXT',
+          await _addColumnIfMissing(
+            db, 'attendance_logs', 'client_event_id', 'TEXT',
           );
           // scan_events records every attempt, including the ones that never
           // produced an attendance row at all — previously those vanished,
@@ -168,8 +214,8 @@ class LocalDatabaseService {
           // log that syncs days later still reports the build that created
           // it rather than whatever the device happens to be running by then
           // — the two diverge every time a Shorebird patch lands.
-          await db.execute(
-            'ALTER TABLE attendance_logs ADD COLUMN app_version TEXT',
+          await _addColumnIfMissing(
+            db, 'attendance_logs', 'app_version', 'TEXT',
           );
         }
       },
