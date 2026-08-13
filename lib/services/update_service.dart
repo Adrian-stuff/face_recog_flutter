@@ -62,6 +62,22 @@ class UpdateService {
   /// Guards against two overlapping check/download cycles.
   bool _inFlight = false;
 
+  /// Both network calls are bounded, because neither the check nor the
+  /// download carries a timeout of its own.
+  ///
+  /// Without these a half-open connection — a captive portal, or the flaky
+  /// office WiFi this kiosk actually lives on — leaves the await hanging
+  /// forever. That would strand [state] on `checking`, so the header spins
+  /// indefinitely and looks broken, and worse, leave [_inFlight] latched true
+  /// for the life of the process, silently blocking every later check. A
+  /// kiosk stays up for weeks, so "silently stops updating" is precisely the
+  /// failure this whole indicator exists to make visible.
+  static const _checkTimeout = Duration(seconds: 20);
+
+  /// Generous: a patch is ~1 MB over clinic WiFi, and a download killed
+  /// halfway just retries on the next cycle.
+  static const _downloadTimeout = Duration(minutes: 5);
+
   /// Whether Shorebird is available in this build.
   bool get isAvailable => _updater.isAvailable;
 
@@ -97,7 +113,7 @@ class UpdateService {
   Future<UpdateStatus> checkForUpdate() async {
     if (!isAvailable) return UpdateStatus.upToDate;
     try {
-      return await _updater.checkForUpdate();
+      return await _updater.checkForUpdate().timeout(_checkTimeout);
     } catch (e) {
       debugPrint('UpdateService: Failed to check for update: $e');
       return UpdateStatus.upToDate;
@@ -111,7 +127,7 @@ class UpdateService {
   Future<bool> performUpdate() async {
     if (!isAvailable) return false;
     try {
-      await _updater.update();
+      await _updater.update().timeout(_downloadTimeout);
       return true;
     } on UpdateException catch (e) {
       debugPrint('UpdateService: Update failed: ${e.message}');

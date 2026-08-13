@@ -1664,9 +1664,18 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Text('App version'),
-        content: ValueListenableBuilder<AppUpdateState>(
-          valueListenable: service.state,
-          builder: (context, state, _) {
+        // Listens to all three, not just state: the version and patch are
+        // read asynchronously and currentPatch changes again after a
+        // download, so a dialog bound only to state would sit showing
+        // "Unknown" or a stale patch number.
+        content: ListenableBuilder(
+          listenable: Listenable.merge([
+            service.state,
+            service.releaseVersion,
+            service.currentPatch,
+          ]),
+          builder: (context, _) {
+            final state = service.state.value;
             return Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,

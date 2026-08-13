@@ -1,0 +1,15 @@
+# Goldens are excluded from the default run: their pixel output depends on the
+# host's font rendering and Flutter version, so a mismatch on a different
+# machine means "rendered somewhere else", not "something broke".
+#
+# Run them deliberately:
+#   flutter test --tags golden --run-skipped
+# Regenerate after an intentional visual change:
+#   flutter test --tags golden --run-skipped --update-goldens
+#
+# The StatusChip contrast assertions are deliberately NOT tagged — they are
+# pure arithmetic, identical on every machine, and they guard the accessibility
+# regression that a screenshot cannot show.
+tags:
+  golden:
+    skip: "platform-sensitive; run with --tags golden --run-skipped"
