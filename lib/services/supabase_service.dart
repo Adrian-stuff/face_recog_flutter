@@ -63,6 +63,7 @@ class SupabaseService {
   bool _syncingLogs = false;
   bool _syncingEncodings = false;
   bool _syncingScanEvents = false;
+  bool _syncingEmployees = false;
 
   static const int _scanBatchSize = 50;
   static const int _maxScanBackoffSeconds = 30 * 60;
@@ -139,6 +140,18 @@ class SupabaseService {
   Future<void> syncEmployees() async {
     if (!await isOnline) return;
 
+    // syncEmployees() is fired from many call sites (periodic timer,
+    // reconnect handler, post-match refresh, registration) without always
+    // being awaited, so overlapping invocations are routine rather than
+    // rare. Each one runs a `db.transaction()` against the same local
+    // table; without this guard two overlapping transactions on the local
+    // db raced and sqflite occasionally failed to roll one of them back
+    // ("Cannot perform this operation because there is no current
+    // transaction. sql 'ROLLBACK'"). syncLogs/syncEncodings/syncScanEvents
+    // already use this same guard for the same reason.
+    if (_syncingEmployees) return;
+    _syncingEmployees = true;
+
     try {
       // Use the optimized API endpoint to fetch employees with cached/limited encodings
       final url = Uri.parse('${AppConfig.nextJsBaseUrl}/api/sync/employees');
@@ -205,6 +218,8 @@ class SupabaseService {
         'Employee sync failed: $e',
         context: 'syncEmployees',
       );
+    } finally {
+      _syncingEmployees = false;
     }
   }
 

@@ -102,6 +102,13 @@ class LocalDatabaseService {
     },
   };
 
+  /// The reconciliation target, exposed read-only so migration tests can
+  /// check convergence against the real declared schema instead of a
+  /// hand-copied duplicate that could silently drift from it.
+  @visibleForTesting
+  static Map<String, Map<String, String>> get expectedColumnsForTesting =>
+      _expectedColumns;
+
   /// Columns in [expected] that [actual] doesn't have.
   ///
   /// Split out as a pure function so the reconciliation rule is unit-testable
@@ -1017,12 +1024,22 @@ class LocalDatabaseService {
 
   /// Client event ids this device believes it successfully synced, for
   /// checking against what the server actually holds.
+  ///
+  /// `is_synced = 1` alone isn't enough: [markLogsAsFailed] also sets
+  /// `is_synced = 1` (with `sync_error` set) for punches the server
+  /// permanently rejected, so they stop being retried by [getUnsyncedLogs].
+  /// Without excluding those here, a legitimately-rejected punch (e.g.
+  /// "Already timed in") gets submitted to reconcile as if it were
+  /// confirmed, comes back "missing" (it genuinely was never recorded),
+  /// gets re-queued, gets rejected again for the same underlying reason,
+  /// and repeats forever — the same clientEventId re-appearing in every
+  /// reconciliation cycle instead of the gap actually closing.
   Future<List<String>> getSyncedClientEventIds({int limit = 200}) async {
     final db = await database;
     final rows = await db.query(
       'attendance_logs',
       columns: ['client_event_id'],
-      where: 'is_synced = 1 AND client_event_id IS NOT NULL',
+      where: 'is_synced = 1 AND sync_error IS NULL AND client_event_id IS NOT NULL',
       orderBy: 'timestamp DESC',
       limit: limit,
     );

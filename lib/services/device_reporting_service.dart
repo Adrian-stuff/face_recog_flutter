@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../config/app_config.dart';
 import 'local_database_service.dart';
 import 'provisioning_service.dart';
+import 'update_service.dart';
 
 /// Reports mobile app errors and sync health to the web dashboard so admins
 /// can see kiosk problems (crashes, stuck syncs) without physically checking
@@ -97,7 +98,14 @@ class DeviceReportingService {
 
       try {
         final info = await PackageInfo.fromPlatform();
-        _appVersion = '${info.version}+${info.buildNumber}';
+        // Two devices can report the same native build (e.g. 1.2.0+67) while
+        // running different Shorebird OTA patches — the buildNumber alone
+        // can't tell them apart, which is exactly the "which devices are on
+        // the bad patch" question this reporting exists to answer.
+        final patch = await UpdateService.instance.getCurrentPatchNumber();
+        _appVersion = patch != null
+            ? '${info.version}+${info.buildNumber}-p$patch'
+            : '${info.version}+${info.buildNumber}';
       } catch (e) {
         debugPrint('DeviceReportingService: failed to read app version: $e');
       }

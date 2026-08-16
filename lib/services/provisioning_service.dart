@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../config/app_config.dart';
+import 'update_service.dart';
 
 /// Why this device is or isn't allowed to operate right now.
 enum ProvisioningState {
@@ -175,7 +176,14 @@ class ProvisioningService {
     String label = Platform.operatingSystem;
     try {
       final info = await PackageInfo.fromPlatform();
-      label = '${Platform.operatingSystem} ${info.version}';
+      // The native build number alone can't tell two devices apart once
+      // Shorebird is in the picture: two kiosks on the same build (e.g.
+      // 1.2.0+67) can be running different OTA patches, which is exactly
+      // the divergence a platform operator needs visible on this label.
+      final patch = await UpdateService.instance.getCurrentPatchNumber();
+      label = patch != null
+          ? '${Platform.operatingSystem} ${info.version}+${info.buildNumber}-p$patch'
+          : '${Platform.operatingSystem} ${info.version}+${info.buildNumber}';
     } catch (_) {
       // Label is cosmetic; pairing shouldn't fail because we couldn't read it.
     }
