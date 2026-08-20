@@ -398,10 +398,18 @@ class _FaceScanScreenState extends State<FaceScanScreen>
             ),
           );
         }
-        setState(() {
-          _isProcessing = false;
-          _statusMessage = "Ready";
-        });
+        // The no-match branch runs after an await, so the screen may already
+        // be gone — a WiFi blip tears this route down mid-scan. Every other
+        // setState in this method is guarded; this one was missed, and an
+        // unguarded setState after dispose surfaces as "Null check operator
+        // used on a null value" from State.setState, which is what the kiosk
+        // reported against _recordAttendance.
+        if (mounted) {
+          setState(() {
+            _isProcessing = false;
+            _statusMessage = "Ready";
+          });
+        }
         return;
       }
 
