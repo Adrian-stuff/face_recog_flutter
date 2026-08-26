@@ -129,6 +129,8 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
         return 'No match';
       case 'liveness_failed':
         return 'Liveness failed';
+      case 'device_rejected':
+        return 'Declined (already recorded)';
       default:
         return outcome;
     }

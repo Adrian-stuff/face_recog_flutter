@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:mobile_app/services/local_database_service.dart';
@@ -75,6 +77,116 @@ void main() {
         ),
         isEmpty,
       );
+    });
+  });
+  group('every table is inside the reconciliation net', () {
+    /// The tables the service actually creates, read off its own DDL rather
+    /// than restated here — a list maintained by hand is a list that drifts.
+    ///
+    /// This is the check that was missing. `_reconcileSchema` skips any table
+    /// absent from the declared target, so a table created by onCreate but
+    /// never declared gets no self-healing at all: a column added to it
+    /// arrives only if onUpgrade fires, which is the assumption reconciliation
+    /// exists precisely because it cannot rely on. scan_events and
+    /// error_reports sat outside it for their whole lifetime.
+    test('declares every table it creates', () {
+      final source = File(
+        'lib/services/local_database_service.dart',
+      ).readAsStringSync();
+
+      final created = RegExp(r'CREATE TABLE (?:IF NOT EXISTS )?([a-z_]+)')
+          .allMatches(source)
+          .map((m) => m.group(1)!)
+          .toSet();
+
+      final declared = LocalDatabaseService.expectedColumnsForTesting.keys.toSet();
+
+      expect(
+        created.difference(declared),
+        isEmpty,
+        reason:
+            'These tables are created but not declared in _expectedColumns, so '
+            '_reconcileSchema will never repair them: '
+            '${created.difference(declared).join(", ")}',
+      );
+    });
+
+    /// A table has to be created on both routes into the schema.
+    ///
+    /// `_reconcileSchema` deliberately skips a table that does not exist —
+    /// creating one is onCreate's job, and inventing it would mask a real
+    /// problem. So a table wired only into onUpgrade never reaches a fresh
+    /// install, and one wired only into onCreate never reaches an existing
+    /// device. Neither failure is visible until something tries to write to
+    /// it, and the self-healing that covers a missing *column* does not cover
+    /// a missing *table*.
+    ///
+    /// Sharing one DDL constant between the two paths is what makes them
+    /// agree; this asserts both paths actually use it.
+    test('creates every table on both the fresh-install and upgrade paths', () {
+      final source = File(
+        'lib/services/local_database_service.dart',
+      ).readAsStringSync();
+
+      final onCreateAt = source.indexOf('onCreate:');
+      final onUpgradeAt = source.indexOf('onUpgrade:');
+      expect(onCreateAt, greaterThan(-1));
+      expect(onUpgradeAt, greaterThan(onCreateAt));
+
+      final ddlConstants = RegExp(r'static const String (_create\w+Sql)')
+          .allMatches(source)
+          .map((m) => m.group(1)!)
+          .toSet();
+      expect(ddlConstants, isNotEmpty, reason: 'no CREATE TABLE constants found');
+
+      for (final name in ddlConstants) {
+        final uses = RegExp('\\b$name\\b')
+            .allMatches(source)
+            .map((m) => m.start)
+            // The declaration itself sits after both handlers; ignore it.
+            .where((at) => at < source.indexOf('static const String $name'))
+            .toList();
+
+        expect(
+          uses.where((at) => at > onCreateAt && at < onUpgradeAt),
+          isNotEmpty,
+          reason: '$name is never executed from onCreate — fresh installs '
+              'will not have this table',
+        );
+        expect(
+          uses.where((at) => at > onUpgradeAt),
+          isNotEmpty,
+          reason: '$name is never executed from onUpgrade — existing devices '
+              'will not have this table',
+        );
+      }
+    });
+
+    /// ALTER TABLE ADD COLUMN cannot add a NOT NULL column without a default,
+    /// so declaring one would make reconciliation throw on the devices that
+    /// need it most — the ones whose upgrade already failed.
+    test('declares nothing that cannot be added by ALTER TABLE', () {
+      for (final table in LocalDatabaseService.expectedColumnsForTesting.entries) {
+        for (final column in table.value.entries) {
+          final type = column.value.toUpperCase();
+          if (type.contains('NOT NULL')) {
+            expect(
+              type,
+              contains('DEFAULT'),
+              reason:
+                  '${table.key}.${column.key} is NOT NULL with no DEFAULT — '
+                  'ALTER TABLE ADD COLUMN cannot add that to an existing table.',
+            );
+          }
+          expect(
+            type,
+            isNot(contains('PRIMARY KEY')),
+            reason:
+                '${table.key}.${column.key} declares a PRIMARY KEY, which can '
+                'only be set when the table is created.',
+          );
+        }
+      }
     });
   });
 }

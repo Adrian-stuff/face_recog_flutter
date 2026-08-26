@@ -1,6 +1,15 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import '../config/kiosk_config.generated.dart';
+
+/// The kiosk's clock, sized to be read from across a room.
+///
+/// Time and date are separate lines rather than one run of text: at this
+/// size a single "Mon, 25 Oct 2023 | 10:30:05 AM" string either overflows a
+/// phone-width kiosk or has to be shrunk back down to the point that being
+/// large stops meaning anything. Splitting them lets the time carry the
+/// weight and the date sit quietly underneath.
 class RealTimeClock extends StatefulWidget {
   const RealTimeClock({super.key});
 
@@ -31,61 +40,104 @@ class _RealTimeClockState extends State<RealTimeClock> {
     super.dispose();
   }
 
-  String _formatDateTime(DateTime dt) {
-    // Simple formatting without intl package to avoid dependency issues
-    // Format: "Mon, 25 Oct 2023 | 10:30:05 AM"
+  // Formatted by hand rather than through intl, as before — this widget is
+  // on the first frame the kiosk paints and shouldn't wait on locale data.
+  static const _weekdays = [
+    'Monday',
+    'Tuesday',
+    'Wednesday',
+    'Thursday',
+    'Friday',
+    'Saturday',
+    'Sunday',
+  ];
 
-    const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    const months = [
-      'Jan',
-      'Feb',
-      'Mar',
-      'Apr',
-      'May',
-      'Jun',
-      'Jul',
-      'Aug',
-      'Sep',
-      'Oct',
-      'Nov',
-      'Dec',
-    ];
+  static const _months = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ];
 
-    final weekday = weekdays[dt.weekday - 1];
-    final day = dt.day.toString();
-    final month = months[dt.month - 1];
-    final year = dt.year.toString();
-
-    var hour = dt.hour;
-    final minute = dt.minute.toString().padLeft(2, '0');
-    final second = dt.second.toString().padLeft(2, '0');
-    final period = hour >= 12 ? 'PM' : 'AM';
-
-    if (hour > 12) hour -= 12;
-    if (hour == 0) hour = 12;
-
-    return '$weekday, $day $month $year | $hour:$minute:$second $period';
-  }
+  String _formatDate(DateTime dt) =>
+      '${_weekdays[dt.weekday - 1]}, ${_months[dt.month - 1]} ${dt.day}, ${dt.year}';
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.black54,
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Text(
-        _formatDateTime(_dateTime),
-        style: const TextStyle(
-          color: Colors.white,
-          fontSize: 16,
-          fontWeight: FontWeight.w500,
-          fontFeatures: [
-            FontFeature.tabularFigures(),
-          ], // constant width numbers for clock
+    var hour = _dateTime.hour;
+    final minute = _dateTime.minute.toString().padLeft(2, '0');
+    final second = _dateTime.second.toString().padLeft(2, '0');
+    final period = hour >= 12 ? 'PM' : 'AM';
+    if (hour > 12) hour -= 12;
+    if (hour == 0) hour = 12;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Baseline-aligned so the seconds and AM/PM sit on the same line as
+        // the hours rather than floating against the digits' full height.
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.baseline,
+            textBaseline: TextBaseline.alphabetic,
+            children: [
+              Text(
+                '$hour:$minute',
+                style: const TextStyle(
+                  fontSize: 60,
+                  height: 1.05,
+                  fontWeight: FontWeight.w600,
+                  color: KioskColors.baseContent,
+                  letterSpacing: -1.5,
+                  // Constant-width digits, so the layout doesn't twitch on
+                  // every tick.
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                second,
+                style: const TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.w500,
+                  color: KioskColors.muted,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                period,
+                style: const TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.w600,
+                  color: KioskColors.muted,
+                ),
+              ),
+            ],
+          ),
         ),
-      ),
+        const SizedBox(height: 2),
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(
+            _formatDate(_dateTime),
+            style: const TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.w500,
+              color: KioskColors.muted,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

@@ -100,6 +100,37 @@ class LocalDatabaseService {
       'is_synced': 'INTEGER DEFAULT 0',
       'sync_error': 'TEXT',
     },
+    // scan_events and error_reports were outside the reconciliation net until
+    // now: five tables exist, three were declared here, so a column added to
+    // either of these depended entirely on onUpgrade firing. That is the exact
+    // assumption _reconcileSchema exists because it cannot be trusted — a
+    // partly-applied upgrade leaves user_version unchanged and the column
+    // never arrives. Only NULLable or defaulted columns belong here; ALTER
+    // TABLE ADD COLUMN cannot add a NOT NULL column without a default, and
+    // the PRIMARY KEY is omitted because it can only be set at CREATE time.
+    'scan_events': {
+      'employee_id': 'INTEGER',
+      'employee_name': 'TEXT',
+      'attendance_type': 'TEXT',
+      'match_confidence': 'REAL',
+      'liveness_passed': 'INTEGER',
+      'thumbnail': 'TEXT',
+      'rejection_reason': 'TEXT',
+      'lat': 'REAL',
+      'lng': 'REAL',
+      'wifi_ssid': 'TEXT',
+      'wifi_bssid': 'TEXT',
+      'is_uploaded': 'INTEGER DEFAULT 0',
+      'server_confirmed': 'INTEGER DEFAULT 0',
+      'upload_attempts': 'INTEGER DEFAULT 0',
+      'last_attempt_at': 'TEXT',
+    },
+    'error_reports': {
+      'context': 'TEXT',
+      'app_version': 'TEXT',
+      'is_uploaded': 'INTEGER DEFAULT 0',
+      'upload_attempts': 'INTEGER DEFAULT 0',
+    },
   };
 
   /// The reconciliation target, exposed read-only so migration tests can
@@ -779,6 +810,56 @@ class LocalDatabaseService {
     );
 
     return rows.where((row) => _isLocalToday(row['timestamp'])).toList();
+  }
+
+  /// What each employee has punched today, keyed by employee id, as a map of
+  /// attendance type to the timestamp it was recorded at — e.g.
+  /// `{7: {'time-in': '...', 'time-out': '...'}}`. Employees with nothing
+  /// today are simply absent from the result.
+  ///
+  /// The roster panel on the scan screen joins this against the employee
+  /// list it already holds, so this deliberately returns punches only: one
+  /// roster source on screen means a name can't appear in the roll call but
+  /// be missing from the selector behind it.
+  ///
+  /// Carries the same "this device only" caveat as [getTodayAttendance] — a
+  /// shift started on another kiosk isn't here, so the answer is what this
+  /// device has seen rather than a company-wide roll call.
+  ///
+  /// Rows carrying a `sync_error` are excluded for exactly the reason
+  /// [hasLogForToday] excludes them: the server refused them, so they never
+  /// became a real punch and must not read as one here.
+  Future<Map<int, Map<String, String>>> getTodayPunchesByEmployee() async {
+    final db = await database;
+    final (windowStart, windowEnd) = _todayScanWindow();
+
+    final rows = await db.query(
+      'attendance_logs',
+      columns: ['employee_id', 'type', 'timestamp'],
+      where: 'timestamp >= ? AND timestamp < ? AND sync_error IS NULL',
+      whereArgs: [windowStart, windowEnd],
+      // Ascending, so when a type somehow has two rows the earliest wins
+      // below — the punch that actually opened the stretch is the one worth
+      // showing a "since" time for.
+      orderBy: 'timestamp ASC',
+    );
+
+    final punches = <int, Map<String, String>>{};
+    for (final row in rows) {
+      // The date-prefix window above is a deliberate superset; this is where
+      // the device's real UTC offset decides what "today" means.
+      if (!_isLocalToday(row['timestamp'])) continue;
+      final employeeId = row['employee_id'];
+      final type = row['type'];
+      final timestamp = row['timestamp'];
+      if (employeeId is! int || type is! String || timestamp is! String) {
+        continue;
+      }
+      punches.putIfAbsent(employeeId, () => <String, String>{});
+      punches[employeeId]!.putIfAbsent(type, () => timestamp);
+    }
+
+    return punches;
   }
 
   Future<void> insertLog(

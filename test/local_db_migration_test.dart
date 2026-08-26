@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:mobile_app/services/local_database_service.dart';
@@ -93,9 +95,17 @@ void main() {
         'id', 'employee_id', 'descriptor', 'is_golden', 'created_at',
         'is_synced', 'sync_error',
       },
-      // scan_events also exists from here, but it's a table CREATE (not a
-      // column reconciliation), so it's out of scope for missingColumns —
-      // see the note in the group below.
+      // scan_events exists from v6. Now that it is declared in
+      // _expectedColumns it has to be described here too, or the
+      // reconciliation group above would skip the very table that spent its
+      // whole life outside the safety net.
+      'scan_events': {
+        'id', 'client_event_id', 'employee_id', 'employee_name', 'scanned_at',
+        'outcome', 'attendance_type', 'match_confidence', 'liveness_passed',
+        'thumbnail', 'rejection_reason', 'lat', 'lng', 'wifi_ssid',
+        'wifi_bssid', 'is_uploaded', 'server_confirmed', 'upload_attempts',
+        'last_attempt_at',
+      },
     },
     7: {
       'employees': {
@@ -110,7 +120,21 @@ void main() {
         'id', 'employee_id', 'descriptor', 'is_golden', 'created_at',
         'is_synced', 'sync_error',
       },
-      // error_reports also exists from here — same table-vs-column note.
+      // scan_events exists from v6. Now that it is declared in
+      // _expectedColumns it has to be described here too, or the
+      // reconciliation group above would skip the very table that spent its
+      // whole life outside the safety net.
+      'scan_events': {
+        'id', 'client_event_id', 'employee_id', 'employee_name', 'scanned_at',
+        'outcome', 'attendance_type', 'match_confidence', 'liveness_passed',
+        'thumbnail', 'rejection_reason', 'lat', 'lng', 'wifi_ssid',
+        'wifi_bssid', 'is_uploaded', 'server_confirmed', 'upload_attempts',
+        'last_attempt_at',
+      },
+      'error_reports': {
+        'id', 'level', 'message', 'context', 'app_version', 'created_at',
+        'is_uploaded', 'upload_attempts',
+      },
     },
   };
 
@@ -131,19 +155,93 @@ void main() {
             ...actualByTable[table]!,
             ...missing.map((e) => e.key),
           };
-          // _expectedColumns deliberately omits the primary key ('id') — it
-          // can only ever come from CREATE TABLE, never from an ALTER — so
-          // it has to be added back in before comparing against the full
-          // real-world column set.
+          // Two things matter, and they are asserted separately because
+          // "no more, no less" was too strong once scan_events and
+          // error_reports joined the declared set.
+          //
+          // _expectedColumns holds only what ALTER TABLE can actually add.
+          // That excludes the primary key, and it also excludes NOT NULL
+          // columns with no default — `outcome`, `scanned_at`, `level`,
+          // `message` and friends exist from CREATE TABLE and can never be
+          // back-filled onto an existing table. A device missing those has a
+          // table that was never created properly, which reconciliation
+          // cannot and should not paper over.
+          //
+          // So: reconciliation must close every declared gap, and must not
+          // invent anything that was not declared.
           expect(
             afterMigration,
-            {'id', ...expected[table]!.keys},
+            containsAll(expected[table]!.keys),
             reason:
-                '$table at v$version: adding what missingColumns() reports '
-                'should reach exactly the declared schema, no more, no less',
+                '$table at v$version: reconciliation should reach every '
+                'declared column',
+          );
+          expect(
+            missing.map((e) => e.key).toSet().difference(
+                  expected[table]!.keys.toSet(),
+                ),
+            isEmpty,
+            reason:
+                '$table at v$version: reconciliation added a column that is '
+                'not in the declared schema',
           );
         }
       });
+    }
+  });
+
+  /// The schema may only ever grow.
+  ///
+  /// Everything that makes a Shorebird rollback survivable rests on this: the
+  /// no-op onDowngrade is safe *because* older code meeting a newer database
+  /// simply ignores columns it does not know about. Rename or drop one and
+  /// that stops being true — the rolled-back build starts querying a column
+  /// that no longer exists, on a device with unsynced punches on it, and
+  /// there is no push-time check anywhere that would have caught it.
+  ///
+  /// historicalSchema is the record of every column this app has ever had.
+  /// This asserts none of them has gone missing from the DDL.
+  test('never drops or renames a column that has ever shipped', () {
+    final source = File(
+      'lib/services/local_database_service.dart',
+    ).readAsStringSync();
+
+    /// Column names inside each CREATE TABLE block in the real DDL.
+    final currentByTable = <String, Set<String>>{};
+    for (final match in RegExp(
+      r'CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\(([^;]*?)\)\s*(?:;|\x27)',
+      dotAll: true,
+    ).allMatches(source)) {
+      final table = match.group(1)!;
+      final body = match.group(2)!;
+      final columns = body
+          .split(',')
+          .map((line) => line.trim().split(RegExp(r'\s+')).first)
+          .where((name) => RegExp(r'^[a-z_]+$').hasMatch(name))
+          .toSet();
+      currentByTable.putIfAbsent(table, () => <String>{}).addAll(columns);
+    }
+
+    expect(currentByTable.keys, isNotEmpty, reason: 'no DDL parsed');
+
+    for (final version in historicalSchema.entries) {
+      for (final table in version.value.entries) {
+        final current = currentByTable[table.key];
+        expect(
+          current,
+          isNotNull,
+          reason: 'table ${table.key} existed at v${version.key} and is no '
+              'longer created at all',
+        );
+        expect(
+          current!,
+          containsAll(table.value),
+          reason: '${table.key}: these columns shipped at v${version.key} and '
+              'are gone from the DDL: '
+              '${table.value.difference(current).join(", ")}. A rolled-back '
+              'build would still query them.',
+        );
+      }
     }
   });
 

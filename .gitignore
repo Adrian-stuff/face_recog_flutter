@@ -55,3 +55,8 @@ env.*.json
 
 # Stray device screenshots
 screen.png
+
+# Released APKs are kept on disk as the reference for tool/check_patch_icons.py
+# (a patch must be checked against the glyphs the fleet actually has), but they
+# are ~120MB each and do not belong in git history.
+apks_*/

@@ -3,18 +3,19 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:table_calendar/table_calendar.dart';
 import '../config/kiosk_config.generated.dart';
 import '../services/device_reporting_service.dart';
 import '../services/face_service.dart';
+import '../services/local_database_service.dart';
 import '../services/permissions_service.dart';
 import '../services/scan_evidence_service.dart';
 import '../services/sound_service.dart';
 import '../services/supabase_service.dart';
 import '../services/update_service.dart';
 import '../widgets/real_time_clock.dart';
+import '../widgets/roll_call_panel.dart';
+import '../widgets/scan_target_bar.dart';
 import '../widgets/status_chip.dart';
-import '../widgets/weather_widget.dart';
 import '../widgets/searchable_employee_selector.dart';
 import '../widgets/punch_confirmation_dialog.dart';
 import 'liveness_check_screen.dart';
@@ -34,6 +35,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   final FaceService _faceService = FaceService();
   final SoundService _soundService = SoundService();
   final PermissionsService _permissionsService = PermissionsService();
+  final LocalDatabaseService _localDb = LocalDatabaseService();
 
   bool _isProcessing = false;
   String _statusMessage = "Loading...";
@@ -44,15 +46,16 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   Timer? _updateCheckTimer;
   List<KioskPermission> _missingPermissions = [];
 
-  // Calendar state
-  CalendarFormat _calendarFormat = CalendarFormat.month;
-  DateTime _focusedDay = DateTime.now();
-  DateTime? _selectedDay;
-
   // Employee selection state
   List<Map<String, dynamic>> _employees = [];
   Map<String, dynamic>? _selectedEmployee;
   bool _isLoadingEmployees = true;
+
+  // Today's punches from this device, keyed by employee id — joined against
+  // [_employees] to build the roll call. See
+  // LocalDatabaseService.getTodayPunchesByEmployee for the "this device
+  // only" caveat that the panel's footnote passes on to the reader.
+  Map<int, Map<String, String>> _todayPunches = const {};
 
   // Next-action state, resolved when an employee is selected so the card badge
   // and action buttons can show context before any scan.
@@ -220,17 +223,34 @@ class _FaceScanScreenState extends State<FaceScanScreen>
         setState(() => _isLoadingEmployees = false);
       }
     }
+    await _loadTodayPunches();
+  }
+
+  Future<void> _loadTodayPunches() async {
+    try {
+      final punches = await _localDb.getTodayPunchesByEmployee();
+      if (mounted) setState(() => _todayPunches = punches);
+    } catch (e) {
+      // The roll call is a convenience, never a precondition for punching —
+      // a failed read leaves the last good list on screen rather than
+      // taking the scan screen down with it.
+      debugPrint('Error loading today\'s punches: $e');
+    }
+  }
+
+  void _selectEmployee(Map<String, dynamic> employee) {
+    setState(() {
+      _selectedEmployee = employee;
+      _nextAction = null; // reset while loading
+      _nextActionIsAuthoritative = false;
+    });
+    _loadNextAction(employee['id'] as int);
   }
 
   void _openEmployeeSelector() async {
     final selected = await SearchableEmployeeSelector.show(context, _employees);
     if (selected != null && mounted) {
-      setState(() {
-        _selectedEmployee = selected;
-        _nextAction = null; // reset while loading
-        _nextActionIsAuthoritative = false;
-      });
-      _loadNextAction(selected['id'] as int);
+      _selectEmployee(selected);
     }
   }
 
@@ -293,6 +313,13 @@ class _FaceScanScreenState extends State<FaceScanScreen>
 
     setState(() => _statusMessage = "Opening liveness check...");
 
+    // Declared outside the try so the catch block below can still attach
+    // them to a rejected-scan record — by the time recordAttendance() throws
+    // a duplicate-punch error, the face was already matched, so this is the
+    // same evidence a successful scan would have carried.
+    String? thumbnail;
+    dynamic similarity;
+
     try {
       // Navigate to LivenessCheckScreen — returns photo path on success.
       final photoPath = await Navigator.push<String?>(
@@ -320,7 +347,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
 
       // Built once and reused across every outcome below, so a scan that
       // fails still carries a picture of who was standing there.
-      final thumbnail = await ScanEvidenceService.thumbnailFromFile(photoPath);
+      thumbnail = await ScanEvidenceService.thumbnailFromFile(photoPath);
 
       // Generate embedding from photo.
       final embedding = await _faceService.getFaceEmbeddingFromFile(photoPath);
@@ -359,32 +386,50 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       );
 
       if (matchResult == null) {
+        // Two different failures reach this branch, and they were being
+        // reported as the same one. If the device holds no face data for this
+        // employee, nothing was compared — saying "did not match" blames the
+        // person in front of the camera for a gap in the kiosk's own roster.
+        // Offline the distinction is the whole story, because the online
+        // fallback that would otherwise have found their face is unreachable.
+        final hasFaceData = await _supabaseService.hasCachedFaceFor(employeeId);
+
         // The employee may well insist this was them. Keeping the capture
         // means the question can be settled by looking, rather than by
         // whether anyone believes the kiosk.
         await _supabaseService.recordFailedScan(
-          outcome: 'no_match',
+          outcome: hasFaceData ? 'no_match' : 'no_face_data',
           thumbnail: thumbnail,
           employeeId: employeeId,
           employeeName: '$firstName $lastName',
           livenessPassed: true,
-          reason: 'Face did not match the selected employee',
+          reason: hasFaceData
+              ? 'Face did not match the selected employee'
+              : 'This kiosk holds no face data for this employee, so nothing was compared. '
+                  'Their face was enrolled after the last sync, or on another device.',
         );
 
         await _soundService.playError(
-          message: "Face does not match $firstName $lastName",
+          message: hasFaceData
+              ? "Face does not match $firstName $lastName"
+              : "No face data on this device for $firstName $lastName",
         );
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Row(
-                children: const [
-                  Icon(Icons.warning_amber_rounded, color: Colors.white),
-                  SizedBox(width: 8),
+                children: [
+                  const Icon(Icons.warning_amber_rounded, color: Colors.white),
+                  const SizedBox(width: 8),
                   Expanded(
+                    // Telling someone their face did not match, when the
+                    // kiosk never had their face, sends them to re-scan over
+                    // and over on a problem only an admin can clear.
                     child: Text(
-                      "Face does not match the selected employee. Please try again or select the correct employee.",
+                      hasFaceData
+                          ? "Face does not match the selected employee. Please try again or select the correct employee."
+                          : "This kiosk has no face data for $firstName $lastName yet. Ask your administrator to sync this device.",
                     ),
                   ),
                 ],
@@ -414,7 +459,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       }
 
       // Face matched! Record attendance + improve dataset
-      final similarity = matchResult['similarity'];
+      similarity = matchResult['similarity'];
 
       // Improve Dataset (Fire & Forget). saveFaceDescriptor already falls
       // back to the offline queue internally when there's no connection —
@@ -552,6 +597,22 @@ class _FaceScanScreenState extends State<FaceScanScreen>
           'Failed to record attendance: $e',
           context: 'face_scan_screen._recordAttendance type=$type\n$stack',
         );
+      } else {
+        // The face matched and passed liveness, but recordAttendance()
+        // declined to write it (already timed in today, active overtime
+        // session, etc.). That's exactly the kind of attempt Scan History
+        // exists to prove happened — without this, it vanished the same way
+        // no-match/liveness-failed scans used to before recordFailedScan()
+        // was added for them.
+        await _supabaseService.recordFailedScan(
+          outcome: 'device_rejected',
+          thumbnail: thumbnail,
+          employeeId: employeeId,
+          employeeName: '$firstName $lastName',
+          matchConfidence: similarity is num ? similarity.toDouble() : null,
+          livenessPassed: true,
+          reason: displayMessage,
+        );
       }
 
       if (mounted) {
@@ -574,6 +635,10 @@ class _FaceScanScreenState extends State<FaceScanScreen>
         });
       }
       _refreshSyncStatus();
+      // The punch that just landed (or was refused) is what the roll call
+      // above is reporting on, so refresh it before the employee walks away
+      // — seeing their own name move columns is the confirmation.
+      _loadTodayPunches();
     }
   }
 
@@ -749,29 +814,6 @@ class _FaceScanScreenState extends State<FaceScanScreen>
     );
   }
 
-  Color _getAvatarColor(int id) {
-    final colors = [
-      const Color(0xFF1E88E5),
-      const Color(0xFF43A047),
-      const Color(0xFF8E24AA),
-      const Color(0xFFE53935),
-      const Color(0xFFFB8C00),
-      const Color(0xFF00ACC1),
-      const Color(0xFF3949AB),
-      const Color(0xFF7CB342),
-    ];
-    return colors[id % colors.length];
-  }
-
-  String _getInitials(Map<String, dynamic> emp) {
-    final first = (emp['first_name'] ?? '').toString();
-    final last = (emp['last_name'] ?? '').toString();
-    String initials = '';
-    if (first.isNotEmpty) initials += first[0].toUpperCase();
-    if (last.isNotEmpty) initials += last[0].toUpperCase();
-    return initials.isEmpty ? '?' : initials;
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -820,407 +862,108 @@ class _FaceScanScreenState extends State<FaceScanScreen>
         child: Column(
           children: [
             if (_recentRejections.isNotEmpty) _buildRejectionBanner(),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    // 1. Date & Time
-                    const Center(child: RealTimeClock()),
-                    const SizedBox(height: 20),
 
-                    // 2. Weather Widget
-                    const WeatherWidget(),
-                    const SizedBox(height: 20),
+            // The page itself no longer scrolls. On a kiosk everything here
+            // is either always relevant (the clock, who is selected, the
+            // punch buttons) or is a list that scrolls on its own, and a
+            // scrolling page just meant the buttons could be somewhere off
+            // screen when someone reached for them.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // 1. Date & Time
+                  const Center(child: RealTimeClock()),
+                  const SizedBox(height: 16),
 
-                    // 3. Status Display
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: KioskColors.info.withValues(alpha: 0.1),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: KioskColors.info.withValues(alpha: 0.3)),
-                      ),
-                      child: Text(
-                        _statusMessage,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w500,
-                          color: KioskColors.info,
-                        ),
+                  // 2. Status Display
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: KioskColors.info.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: KioskColors.info.withValues(alpha: 0.3),
                       ),
                     ),
-                    const SizedBox(height: 20),
-
-                    // 4. Employee Selector Card
-                    _buildEmployeeSelectorCard(),
-                    const SizedBox(height: 20),
-
-                    // 5. Calendar
-                    Card(
-                      elevation: 4,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: Padding(
-                        padding: const EdgeInsets.all(8.0),
-                        child: TableCalendar(
-                          firstDay: DateTime.utc(2020, 1, 1),
-                          lastDay: DateTime.utc(2030, 12, 31),
-                          focusedDay: _focusedDay,
-                          calendarFormat: _calendarFormat,
-                          selectedDayPredicate: (day) {
-                            return isSameDay(_selectedDay, day);
-                          },
-                          onDaySelected: (selectedDay, focusedDay) {
-                            if (!isSameDay(_selectedDay, selectedDay)) {
-                              setState(() {
-                                _selectedDay = selectedDay;
-                                _focusedDay = focusedDay;
-                              });
-                            }
-                          },
-                          onFormatChanged: (format) {
-                            if (_calendarFormat != format) {
-                              setState(() {
-                                _calendarFormat = format;
-                              });
-                            }
-                          },
-                          onPageChanged: (focusedDay) {
-                            _focusedDay = focusedDay;
-                          },
-                          headerStyle: const HeaderStyle(
-                            formatButtonVisible: false,
-                            titleCentered: true,
-                          ),
-                        ),
+                    child: Text(
+                      _statusMessage,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w500,
+                        color: KioskColors.info,
                       ),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
             ),
 
-            // 6. Action Buttons (Sticky at bottom)
+            // 3. Roll call — who still owes a punch today, and the fastest
+            // way to pick yourself. Takes whatever height is left.
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+                child: _isLoadingEmployees
+                    ? const Center(
+                        child: SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      )
+                    : RollCallPanel(
+                        employees: _employees,
+                        punches: _todayPunches,
+                        selectedEmployeeId: _selectedEmployee?['id'] as int?,
+                        // Null while a scan is in flight, which greys out
+                        // tapping rather than letting a second employee be
+                        // selected out from under the one being recorded.
+                        onSelect: _isProcessing ? null : _selectEmployee,
+                      ),
+              ),
+            ),
+
+            // 4. Who is being scanned + the punch buttons, pinned together at
+            // the bottom. The identity has to travel with the buttons: it is
+            // the thing the button is about to act on, and a card left up in
+            // the scroll body is off screen at the moment it matters most.
             Container(
               padding: const EdgeInsets.all(16.0),
               decoration: BoxDecoration(
                 color: Colors.white,
                 boxShadow: [
                   BoxShadow(
-                    color: Colors.black.withOpacity(0.1),
+                    color: Colors.black.withValues(alpha: 0.1),
                     blurRadius: 10,
                     offset: const Offset(0, -4),
                   ),
                 ],
               ),
-              child: _buildNextActionButtons(),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildEmployeeSelectorCard() {
-    if (_isLoadingEmployees) {
-      return Card(
-        elevation: 3,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: const Padding(
-          padding: EdgeInsets.all(24),
-          child: Center(
-            child: Column(
-              children: [
-                SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-                SizedBox(height: 12),
-                Text(
-                  'Loading employees...',
-                  style: TextStyle(color: KioskColors.muted),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
-
-    if (_selectedEmployee != null) {
-      return _buildSelectedEmployeeCard();
-    }
-
-    // No employee selected — show selector prompt
-    return Card(
-      elevation: 3,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      child: InkWell(
-        onTap: _openEmployeeSelector,
-        borderRadius: BorderRadius.circular(16),
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: KioskColors.info.withValues(alpha: 0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: Icon(
-                  Icons.person_search_rounded,
-                  size: 28,
-                  color: KioskColors.info,
-                ),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Who are you?',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF1A1A2E),
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Tap to select your name',
-                      style: TextStyle(fontSize: 14, color: KioskColors.muted),
-                    ),
-                  ],
-                ),
-              ),
-              Icon(
-                Icons.arrow_forward_ios_rounded,
-                size: 20,
-                color: KioskColors.muted,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSelectedEmployeeCard() {
-    final emp = _selectedEmployee!;
-    final photoUrl = emp['photo_url'] as String?;
-    final empId = emp['id'] as int;
-
-    return Card(
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
-          gradient: LinearGradient(
-            colors: [_getAvatarColor(empId).withOpacity(0.05), Colors.white],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
-        ),
-        padding: const EdgeInsets.all(16),
-        child: Row(
-          children: [
-            // Avatar
-            Hero(
-              tag: 'employee_avatar_$empId',
-              child: Container(
-                width: 60,
-                height: 60,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: _getAvatarColor(empId),
-                  boxShadow: [
-                    BoxShadow(
-                      color: _getAvatarColor(empId).withOpacity(0.3),
-                      blurRadius: 10,
-                      offset: const Offset(0, 3),
-                    ),
-                  ],
-                ),
-                child: photoUrl != null
-                    ? ClipOval(
-                        child: Image.network(
-                          photoUrl,
-                          fit: BoxFit.cover,
-                          width: 60,
-                          height: 60,
-                          errorBuilder: (_, __, ___) => Center(
-                            child: Text(
-                              _getInitials(emp),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 22,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                        ),
-                      )
-                    : Center(
-                        child: Text(
-                          _getInitials(emp),
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 22,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-              ),
-            ),
-            const SizedBox(width: 14),
-
-            // Info
-            Expanded(
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                // Without this the punch buttons shrink to their label width
+                // and sit marooned in the middle of the bar, which on a
+                // kiosk is the one control that should be impossible to miss.
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Text(
-                    '${emp['first_name']} ${emp['last_name']}',
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF1A1A2E),
-                    ),
+                  ScanTargetBar(
+                    employee: _selectedEmployee,
+                    nextAction: _nextAction,
+                    isLoadingNextAction: _isLoadingNextAction,
+                    onChange: _isProcessing ? null : _openEmployeeSelector,
+                    onSelect: _isProcessing ? null : _openEmployeeSelector,
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    emp['position'] ?? '',
-                    style: TextStyle(fontSize: 14, color: KioskColors.muted),
-                  ),
-                  const SizedBox(height: 4),
-                  _buildShiftStateBadge(),
+                  const SizedBox(height: 12),
+                  _buildNextActionButtons(),
                 ],
               ),
             ),
-
-            // Change button
-            TextButton.icon(
-              onPressed: _openEmployeeSelector,
-              icon: const Icon(Icons.swap_horiz_rounded, size: 18),
-              label: const Text('Change'),
-              style: TextButton.styleFrom(
-                foregroundColor: KioskColors.info,
-                backgroundColor: KioskColors.info.withValues(alpha: 0.1),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-              ),
-            ),
           ],
         ),
       ),
-    );
-  }
-
-  /// Inline status row for the selected-employee card. Shows the employee's
-  /// current shift state so they know what pressing a button will do.
-  Widget _buildShiftStateBadge() {
-    if (_isLoadingNextAction) {
-      return Row(
-        children: [
-          SizedBox(
-            width: 12,
-            height: 12,
-            child: CircularProgressIndicator(
-              strokeWidth: 1.5,
-              color: KioskColors.muted,
-            ),
-          ),
-          const SizedBox(width: 6),
-          Text(
-            'Checking status…',
-            style: TextStyle(fontSize: 12, color: KioskColors.muted),
-          ),
-        ],
-      );
-    }
-
-    final (icon, label, color, highlight) = switch (_nextAction) {
-      'time-in' => (
-          Icons.login_rounded,
-          'Ready to Time In',
-          KioskColors.success,
-          false,
-        ),
-      'time-out' => (
-          Icons.access_time_rounded,
-          'Active Shift — Tap to Time Out',
-          KioskColors.warning,
-          false,
-        ),
-      'overtime-in' => (
-          Icons.more_time_rounded,
-          'Regular Shift Done — Overtime Available',
-          const Color(0xFF00897B),
-          true, // draw a bordered pill to make it stand out
-        ),
-      'overtime-out' => (
-          Icons.timelapse_rounded,
-          'Overtime Active — Tap to Clock Out',
-          const Color(0xFFE65100),
-          false,
-        ),
-      'done' => (
-          Icons.check_circle_outline_rounded,
-          'Shift Complete',
-          KioskColors.muted,
-          false,
-        ),
-      _ => (
-          Icons.verified_rounded,
-          'Ready to verify',
-          KioskColors.success,
-          false,
-        ),
-    };
-
-    final row = Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, size: 14, color: color),
-        const SizedBox(width: 4),
-        Flexible(
-          child: Text(
-            label,
-            style: TextStyle(
-              fontSize: 12,
-              color: color,
-              fontWeight: FontWeight.w600,
-            ),
-            overflow: TextOverflow.ellipsis,
-          ),
-        ),
-      ],
-    );
-
-    if (!highlight) return row;
-
-    // For overtime-available, wrap in a pill so it really pops
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: color.withValues(alpha: 0.4)),
-      ),
-      child: row,
     );
   }
 

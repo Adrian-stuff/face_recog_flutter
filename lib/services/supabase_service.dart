@@ -575,9 +575,34 @@ class SupabaseService {
         // Rejected events stay pending and keep their attempt count, so the
         // cap in getPendingScanEvents eventually retires them rather than
         // letting one malformed row block the batch behind it.
+        //
+        // Retiring them is quiet, though, and that quiet has already cost us:
+        // the kiosk shipped a `device_rejected` outcome the server did not yet
+        // accept, every such scan was refused, retried ten times and dropped,
+        // and the only trace was a debugPrint nobody reads off a wall-mounted
+        // tablet. Evidence went missing for months with no signal anywhere.
+        //
+        // A rejection is a disagreement between two deployed versions, which
+        // is a thing an operator has to be told about. Reporting it through
+        // the error channel — which queues locally and survives being offline
+        // — turns the next drift into something visible on day one.
         final rejected = (body['rejected'] as List?) ?? const [];
         if (rejected.isNotEmpty) {
           debugPrint('Scan event upload: ${rejected.length} rejected');
+          final reasons = rejected
+              .map((r) => (r as Map)['reason']?.toString() ?? 'unspecified')
+              .toSet()
+              .take(3)
+              .join('; ');
+          unawaited(
+            DeviceReportingService.instance.reportError(
+              'Server refused ${rejected.length} scan event(s) on upload. '
+              'These will be retried and then dropped, losing the evidence. '
+              'Reasons: $reasons',
+              level: 'warning',
+              context: 'scan_event_upload',
+            ),
+          );
         }
         _scanBackoff = Duration.zero;
       } else {
@@ -1618,10 +1643,12 @@ class SupabaseService {
     return (effectiveType: effectiveType, clientEventId: clientEventId);
   }
 
-  /// Records a scan that never became an attendance action at all — no match,
-  /// or a failed liveness check. These previously left no trace, which is
-  /// exactly the gap someone points at when they say they scanned and
-  /// nothing happened.
+  /// Records a scan that never became an attendance action at all — no
+  /// match, a failed liveness check, or a matched-and-live face that
+  /// [recordAttendance] declined to write (e.g. `'device_rejected'` for an
+  /// employee who already timed in today). These previously left no trace,
+  /// which is exactly the gap someone points at when they say they scanned
+  /// and nothing happened.
   Future<void> recordFailedScan({
     required String outcome,
     String? thumbnail,
@@ -1817,6 +1844,14 @@ class SupabaseService {
             'last_name': emp['last_name'] ?? '',
             'position': emp['position'] ?? '',
             'photo_url': emp['image_url'],
+            // Carried through so the avatar can come off disk. The photos
+            // are already downloaded and cached here (see
+            // updateEmployeeLocalImagePath), but dropping the path at this
+            // boundary left every consumer falling back to a network fetch
+            // — which on an offline kiosk means no faces at all, at exactly
+            // the moment someone needs to confirm the kiosk picked the
+            // right person.
+            'local_image_path': emp['local_image_path'],
           },
         )
         .toList();
@@ -1824,6 +1859,23 @@ class SupabaseService {
 
   /// Verifies a face embedding against ALL encodings of a specific employee.
   /// Returns the best similarity score, or null if no match.
+  /// Whether this device actually holds face data for [employeeId].
+  ///
+  /// Distinguishes the two ways [verifyFaceAgainstEmployee] returns null. One
+  /// means the face on camera is not this employee; the other means the
+  /// device was never given their face to compare against — an employee
+  /// enrolled after this kiosk last synced, or enrolled on another device.
+  /// Offline they look identical from the outside, because the online
+  /// fallback that would have papered over the second case is unreachable.
+  ///
+  /// Recording both as "no match" told the employer that somebody's face
+  /// failed verification when nothing was ever verified, and the remedy for
+  /// the two is opposite: re-enrol the face, or sync the device.
+  Future<bool> hasCachedFaceFor(int employeeId) async {
+    final vectors = await _localDb.getCachedVectorsForEmployee(employeeId);
+    return vectors.isNotEmpty;
+  }
+
   Future<Map<String, dynamic>?> verifyFaceAgainstEmployee(
     List<double> embedding,
     int employeeId,

@@ -44,7 +44,6 @@ dependencies:
   screen_brightness: ^1.0.1
   http: ^1.2.0
   intl: ^0.19.0
-  table_calendar: ^3.1.0
   geolocator: ^10.1.0
   wakelock_plus: ^1.2.0
 
