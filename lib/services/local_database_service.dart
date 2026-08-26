@@ -462,8 +462,39 @@ class LocalDatabaseService {
     return null;
   }
 
-  Future<void> syncEmployees(List<Map<String, dynamic>> employees) async {
+  /// Number of employees currently holding at least one usable face vector.
+  ///
+  /// Exposed so the sync path can tell "nobody is enrolled yet" apart from
+  /// "the roster arrived but nothing could be decoded" — the second is a
+  /// defect and looked exactly like the first for as long as the descriptors
+  /// were being double-encoded.
+  int get employeesWithCachedVectors =>
+      _vectorCache.values.where((v) => v.isNotEmpty).length;
+
+  /// Replaces the local roster.
+  ///
+  /// Returns false without touching anything when handed an empty list while
+  /// the device already holds employees. The write below deletes before it
+  /// inserts, so an empty payload wipes every face vector on the device — and
+  /// a kiosk that then goes offline cannot match anyone until it reconnects.
+  /// A 200 carrying `[]` is indistinguishable here from a company-scoping
+  /// regression, so the safe reading is to keep what we have and let the
+  /// caller report it.
+  Future<bool> syncEmployees(List<Map<String, dynamic>> employees) async {
     final db = await database;
+
+    if (employees.isEmpty) {
+      final existing = Sqflite.firstIntValue(
+        await db.rawQuery('SELECT COUNT(*) FROM employees'),
+      );
+      if (existing != null && existing > 0) {
+        debugPrint(
+          'Refusing to replace $existing local employees with an empty sync '
+          'payload; keeping the existing roster.',
+        );
+        return false;
+      }
+    }
 
     // Clear cache before syncing. _cacheInitialized must be reset too —
     // _initializeVectorCache() is a "run once" guard, so without this the
@@ -506,6 +537,7 @@ class LocalDatabaseService {
     debugPrint(
       'Synced ${employees.length} employees to local DB with pre-normalized vectors',
     );
+    return true;
   }
 
   /// Drops every trace of the current company's roster: employee rows, the

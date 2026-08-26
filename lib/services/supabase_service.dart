@@ -191,7 +191,40 @@ class SupabaseService {
         };
       }).toList();
 
-      await _localDb.syncEmployees(localData);
+      final replaced = await _localDb.syncEmployees(localData);
+
+      if (!replaced) {
+        // The roster was kept because the server sent an empty list while this
+        // device already had employees. Nothing broke on the kiosk, but
+        // something is wrong upstream and only the server can explain it.
+        unawaited(
+          DeviceReportingService.instance.reportError(
+            'Employee sync returned 0 employees while this device holds a '
+            'non-empty roster. The local roster was kept rather than wiped. '
+            'Check company scoping on /api/sync/employees.',
+            level: 'warning',
+            context: 'syncEmployees',
+          ),
+        );
+      } else if (localData.isNotEmpty &&
+          _localDb.employeesWithCachedVectors == 0) {
+        // The roster arrived and not one face could be decoded from it.
+        //
+        // This is the shape the double-encoding bug took, and it was silent
+        // for its entire life: offline matching simply never found anyone,
+        // while online the server-side fallback covered for it on every scan.
+        // Nothing threw, so nothing was ever reported. It needs to be loud.
+        unawaited(
+          DeviceReportingService.instance.reportError(
+            'Synced ${localData.length} employees but cached 0 face vectors. '
+            'Offline face matching cannot work on this device. This usually '
+            'means face_features arrived in a shape the decoder does not '
+            'understand, not that nobody is enrolled.',
+            level: 'error',
+            context: 'syncEmployees',
+          ),
+        );
+      }
 
       for (var emp in employees) {
         final empId = emp['id'] as int;

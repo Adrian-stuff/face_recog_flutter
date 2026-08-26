@@ -111,6 +111,42 @@ void main() {
       );
     });
 
+    /// An empty sync payload must never replace a populated roster.
+    ///
+    /// syncEmployees deletes before it inserts, so an empty list wipes every
+    /// face vector on the device, and a kiosk that then goes offline cannot
+    /// match anyone. A 200 carrying `[]` is indistinguishable from a
+    /// company-scoping regression upstream, so the safe reading is to keep
+    /// what is already stored and let the caller report it.
+    ///
+    /// Asserted against the source because the guard is one early return in a
+    /// method that needs a database engine to exercise, and the realistic
+    /// failure is someone deleting it while tidying.
+    test('refuses to replace a populated roster with an empty payload', () {
+      final source = File(
+        'lib/services/local_database_service.dart',
+      ).readAsStringSync();
+
+      final syncAt = source.indexOf('Future<bool> syncEmployees(');
+      expect(
+        syncAt,
+        greaterThan(-1),
+        reason: 'syncEmployees must report whether it replaced the roster',
+      );
+
+      final body = source.substring(syncAt, syncAt + 1400);
+      expect(
+        body,
+        contains('employees.isEmpty'),
+        reason: 'no empty-payload guard before the delete-then-insert',
+      );
+      expect(
+        body.indexOf('employees.isEmpty'),
+        lessThan(body.indexOf("txn.delete('employees')")),
+        reason: 'the guard must run before the roster is deleted',
+      );
+    });
+
     /// A table has to be created on both routes into the schema.
     ///
     /// `_reconcileSchema` deliberately skips a table that does not exist —
