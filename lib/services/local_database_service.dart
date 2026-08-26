@@ -483,9 +483,19 @@ class LocalDatabaseService {
           'last_name': emp['last_name'],
           'position': emp['position'],
           'image_url': emp['image_url'],
-          'face_features': emp['face_features'] != null
-              ? jsonEncode(emp['face_features'])
-              : null,
+          // Already a JSON string by the time it gets here — supabase_service
+          // jsonEncode()s the descriptor list before handing it over. Encoding
+          // it a second time produced a JSON string *containing* JSON, which
+          // jsonDecode then unwrapped to a String rather than a List, so
+          // _initializeVectorCache found nothing to cache and every employee
+          // came back with no local face data. Online that was invisible,
+          // because verification silently fell through to the server; offline
+          // there is no fallback and the kiosk could not match anyone.
+          'face_features': emp['face_features'] is String
+              ? emp['face_features']
+              : (emp['face_features'] != null
+                    ? jsonEncode(emp['face_features'])
+                    : null),
         });
       }
     });
@@ -586,6 +596,73 @@ class LocalDatabaseService {
   }
 
   /// Initialize vector cache by decoding and normalizing all vectors
+  /// Decodes a stored `employees.face_features` value into descriptor
+  /// entries.
+  ///
+  /// Split out as a pure function for the same reason [missingColumns] was:
+  /// the bug it exists to prevent is a decoding bug, and pinning it should not
+  /// require standing up a database engine.
+  ///
+  /// Accepts three shapes, because all three have been written to this column:
+  /// the JSON string supabase_service produces, the same string wrapped in a
+  /// second layer of JSON (what the double-encode wrote before it was fixed),
+  /// and the legacy bare-vector formats that predate golden encodings.
+  @visibleForTesting
+  static List<Map<String, dynamic>> parseFaceFeatures(String? featureStr) {
+    if (featureStr == null || featureStr.isEmpty) return const [];
+
+    final List<Map<String, dynamic>> entries = [];
+    try {
+      var decoded = jsonDecode(featureStr);
+
+      // A row written double-encoded decodes to a String that still holds the
+      // real JSON. Unwrap it rather than making every affected device wait for
+      // a fresh sync to become usable — the devices worst hit are precisely
+      // the ones that cannot reach the server to sync.
+      if (decoded is String) {
+        try {
+          decoded = jsonDecode(decoded);
+        } catch (_) {
+          return const [];
+        }
+      }
+
+      if (decoded is List && decoded.isNotEmpty) {
+        final first = decoded.first;
+        if (first is Map) {
+          for (final item in decoded) {
+            if (item is Map) {
+              final desc = _coerceDescriptor(item['descriptor']);
+              if (desc != null) {
+                entries.add({
+                  'descriptor': desc,
+                  'isGolden': item['is_golden'] == true,
+                });
+              }
+            }
+          }
+        } else if (first is List || first is String) {
+          // Legacy format: [[...], [...]] — all treated as non-golden.
+          for (final v in decoded) {
+            final desc = _coerceDescriptor(v);
+            if (desc != null) {
+              entries.add({'descriptor': desc, 'isGolden': false});
+            }
+          }
+        } else if (first is num) {
+          // Legacy single vector: [...].
+          entries.add({
+            'descriptor': List<double>.from(decoded),
+            'isGolden': false,
+          });
+        }
+      }
+    } catch (_) {
+      return const [];
+    }
+    return entries;
+  }
+
   Future<void> _initializeVectorCache() async {
     if (_cacheInitialized) return;
 
@@ -599,38 +676,7 @@ class LocalDatabaseService {
       if (featureStr == null || featureStr.isEmpty) continue;
 
       try {
-        final decoded = jsonDecode(featureStr);
-        final List<Map<String, dynamic>> entries = [];
-
-        if (decoded is List && decoded.isNotEmpty) {
-          final first = decoded.first;
-          if (first is Map) {
-            // New enriched format: [{"descriptor": [...], "is_golden": true}, ...]
-            for (var item in decoded) {
-              if (item is Map) {
-                final desc = _coerceDescriptor(item['descriptor']);
-                final isGolden = item['is_golden'] == true;
-                if (desc != null) {
-                  entries.add({'descriptor': desc, 'isGolden': isGolden});
-                }
-              }
-            }
-          } else if (first is List || first is String) {
-            // Legacy format: [[...], [...], ...] — treat all as non-golden
-            for (var v in decoded) {
-              final desc = _coerceDescriptor(v);
-              if (desc != null) {
-                entries.add({'descriptor': desc, 'isGolden': false});
-              }
-            }
-          } else if (first is num) {
-            // Legacy single vector: [...] — treat as non-golden
-            entries.add({
-              'descriptor': List<double>.from(decoded),
-              'isGolden': false,
-            });
-          }
-        }
+        final entries = parseFaceFeatures(featureStr);
 
         // Pre-normalize all vectors and store with isGolden
         _vectorCache[empId] = entries.map((e) {
