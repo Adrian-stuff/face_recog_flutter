@@ -29,6 +29,20 @@ ShiftStateDisplay shiftStateDisplay(String? nextAction) => switch (nextAction) {
     label: 'On the clock',
     color: KioskColors.warning,
   ),
+  // Breaks reuse glyphs the shipped release already bundles. A patch carries
+  // no assets, so an icon outside that set renders as an empty box on every
+  // kiosk while looking perfect locally — there is no coffee cup in the 84
+  // glyphs release 1.2.0+67 tree-shook down to.
+  'break-out' => (
+    icon: Icons.wb_sunny,
+    label: 'On the clock — can take a break',
+    color: KioskColors.warning,
+  ),
+  'break-in' => (
+    icon: Icons.wb_sunny,
+    label: 'On a break',
+    color: Color(0xFF6A4CB8),
+  ),
   'overtime-in' => (
     icon: Icons.more_time_rounded,
     label: 'Shift done — this is OVERTIME',

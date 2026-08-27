@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 
@@ -1396,7 +1397,17 @@ class SupabaseService {
   /// early only costs a fallback to the local estimate — far cheaper than
   /// making every employee wait out a long timeout on the flaky WiFi where
   /// this matters most.
-  Future<String?> _serverNextAction(int employeeId) async {
+  Future<String?> _serverNextAction(int employeeId) async =>
+      (await _serverStatus(employeeId))?.action;
+
+  /// The server's full answer, cached on the way past.
+  ///
+  /// The snapshot is what lets an offline kiosk keep narrowing its buttons —
+  /// see [_cacheStatus] — so it is written on every successful lookup rather
+  /// than only when something asks for it.
+  Future<({String? action, List<String> alsoAllowed})?> _serverStatus(
+    int employeeId,
+  ) async {
     if (!await isOnline) return null;
     try {
       final response = await http
@@ -1412,7 +1423,20 @@ class SupabaseService {
       if (response.statusCode == 200) {
         final body = jsonDecode(response.body) as Map<String, dynamic>;
         final action = body['nextAction'] as String?;
-        if (action != null && action.isNotEmpty) return action;
+        // Absent on a server that predates breaks, which is the ordinary
+        // state of things during a staged rollout. An empty list means "only
+        // the one action", which is what that server meant.
+        final also = (body['alsoAllowed'] as List<dynamic>?)
+            ?.whereType<String>()
+            .toList();
+        if (action != null && action.isNotEmpty) {
+          await _cacheStatus(
+            employeeId: employeeId,
+            date: body['date'] as String?,
+            soleWriter: body['soleWriter'] == true,
+          );
+          return (action: action, alsoAllowed: also ?? const <String>[]);
+        }
       } else {
         debugPrint(
           'nextAction: server returned ${response.statusCode}, using local state',
@@ -1424,12 +1448,96 @@ class SupabaseService {
     return null;
   }
 
-  Future<({String? action, bool authoritative})> getEmployeeNextAction(
+  static const String _statusCacheKey = 'attendance_status_cache_v1';
+
+  /// Remembers that the server answered for this employee today, and whether
+  /// it said this device is the only thing writing attendance.
+  ///
+  /// Deliberately small: the punch history this device already keeps is the
+  /// real state, and duplicating it here would give two sources to disagree.
+  /// All this records is *permission* to trust that history offline.
+  Future<void> _cacheStatus({
+    required int employeeId,
+    required String? date,
+    required bool soleWriter,
+  }) async {
+    if (date == null || date.isEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_statusCacheKey);
+      Map<String, dynamic> cache = {};
+      if (raw != null) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map<String, dynamic>) cache = decoded;
+      }
+      // A new day throws the whole thing away rather than merging: yesterday's
+      // permission says nothing about today, and a stale entry is exactly the
+      // input that would make an offline kiosk narrow on a shift it never saw.
+      if (cache['date'] != date) cache = {'date': date, 'employees': <String, dynamic>{}};
+      cache['soleWriter'] = soleWriter;
+      final employees = (cache['employees'] as Map<String, dynamic>?) ?? {};
+      employees['$employeeId'] = true;
+      cache['employees'] = employees;
+      await prefs.setString(_statusCacheKey, jsonEncode(cache));
+    } catch (e) {
+      debugPrint('nextAction: could not cache status ($e)');
+    }
+  }
+
+  /// Whether this device may treat its own punch history as complete for
+  /// [employeeId] right now.
+  ///
+  /// Two conditions, and both matter:
+  ///
+  ///  - the server said this kiosk is the only thing writing attendance for
+  ///    its company today (`soleWriter`), which rules out the browser
+  ///    time-in page and dashboard corrections, and
+  ///  - it answered for *this employee* today, which means the app has been
+  ///    running and online at some point today. That is what rules out a
+  ///    reinstall: a wiped database reads as "never timed in", and an empty
+  ///    cache correctly refuses to narrow on it.
+  Future<bool> _mayTrustLocalHistory(int employeeId, String today) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_statusCacheKey);
+      if (raw == null) return false;
+      return mayTrustLocalHistory(jsonDecode(raw), today, employeeId);
+    } catch (e) {
+      debugPrint('nextAction: could not read status cache ($e)');
+      return false;
+    }
+  }
+
+  /// The rule itself, separated from where the cache is kept.
+  ///
+  /// This decides whether an offline kiosk narrows its buttons to a single
+  /// action, and narrowing on a wrong answer strands an employee with no way
+  /// to clock out — so it is worth being able to test directly rather than
+  /// through SharedPreferences. Every path that is not an explicit yes
+  /// returns false: a malformed cache, a missing field, yesterday's date and
+  /// an unknown employee all mean "keep offering everything".
+  @visibleForTesting
+  static bool mayTrustLocalHistory(
+    Object? cache,
+    String today,
     int employeeId,
-  ) async {
-    final serverAction = await _serverNextAction(employeeId);
-    if (serverAction != null) {
-      return (action: serverAction, authoritative: true);
+  ) {
+    if (cache is! Map) return false;
+    if (cache['date'] != today) return false;
+    if (cache['soleWriter'] != true) return false;
+    final employees = cache['employees'];
+    return employees is Map && employees['$employeeId'] == true;
+  }
+
+  Future<({String? action, List<String> alsoAllowed, bool authoritative})>
+  getEmployeeNextAction(int employeeId) async {
+    final server = await _serverStatus(employeeId);
+    if (server?.action != null) {
+      return (
+        action: server!.action,
+        alsoAllowed: server.alsoAllowed,
+        authoritative: true,
+      );
     }
 
     // Everything below is an estimate from this device's own punch history,
@@ -1441,14 +1549,27 @@ class SupabaseService {
     // on an estimate, or an offline kiosk would refuse to let a real employee
     // clock out.
     try {
+      // A break still open outranks everything else, including a time-out:
+      // ending the shift with the break running leaves a session nobody
+      // closed, which payroll then has to fall back to the roster for.
+      if (await _localDb.isOnBreakToday(employeeId)) {
+        return (
+          action: 'break-in',
+          alsoAllowed: const <String>[],
+          authoritative: await _mayTrustLocalHistory(employeeId, _todayKey()),
+        );
+      }
+
       final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
       final hasTimedOut = await _localDb.hasLogForToday(employeeId, 'time-out');
 
       String action;
+      var alsoAllowed = const <String>[];
       if (!hasTimedIn) {
         action = 'time-in';
       } else if (!hasTimedOut) {
         action = 'time-out';
+        alsoAllowed = const <String>['break-out'];
       } else {
         // Completed regular shift — check overtime state
         final hasOvertimeIn =
@@ -1464,11 +1585,34 @@ class SupabaseService {
           action = 'done';
         }
       }
-      return (action: action, authoritative: false);
+
+      // Normally an estimate, and marked as one. It is promoted to
+      // authoritative only when the server has said this kiosk is the sole
+      // writer *and* answered for this employee today — see
+      // [_mayTrustLocalHistory]. For a single-kiosk company that is the
+      // ordinary case, so the buttons stay narrow through an outage instead
+      // of falling back to offering everything.
+      return (
+        action: action,
+        alsoAllowed: alsoAllowed,
+        authoritative: await _mayTrustLocalHistory(employeeId, _todayKey()),
+      );
     } catch (e) {
       debugPrint('getEmployeeNextAction: local DB error: $e');
-      return (action: null, authoritative: false);
+      return (action: null, alsoAllowed: const <String>[], authoritative: false);
     }
+  }
+
+  /// Today as the server writes it — Manila wall-clock, YYYY-MM-DD.
+  ///
+  /// The kiosks and the server are both in Manila, and the cache is keyed by
+  /// the server's own `date` field, so this has to produce the same string
+  /// rather than whatever the device's locale would format.
+  static String _todayKey() {
+    final now = DateTime.now();
+    return '${now.year.toString().padLeft(4, '0')}-'
+        '${now.month.toString().padLeft(2, '0')}-'
+        '${now.day.toString().padLeft(2, '0')}';
   }
 
   /// Records an attendance action and its evidence.
@@ -1495,6 +1639,51 @@ class SupabaseService {
   }) async {
     // Detect overtime scenario: employee has already completed a regular shift today
     String effectiveType = type;
+
+    // Break punches take their own path server-side and are never
+    // reinterpreted the way a time-in becomes an overtime-in, so they only
+    // need the two guards the device can actually answer offline. Both are
+    // re-checked server-side; these exist so an obvious mistake fails at the
+    // kiosk with a sentence the employee can act on, rather than as a queued
+    // punch that is rejected minutes later with nobody watching.
+    if (type == 'break-out' || type == 'break-in') {
+      final onBreak = await _localDb.isOnBreakToday(employeeId);
+
+      // Local history is only this device's view, and it is wrong in exactly
+      // the case that matters: isOnBreakToday() counts rows with no
+      // sync_error, so one rejected break-out upload erases the session from
+      // the device's memory while the server keeps it open. Refusing on that
+      // basis would lock the employee out of ending their own break — which
+      // is the overtime bug this codebase already paid for once (see the
+      // overtime-out branch below). So a disagreement asks the server before
+      // it refuses, and only an *offline* device refuses on local state
+      // alone, where there is nothing better to go on.
+      if (type == 'break-in' && !onBreak) {
+        final serverAction = await _serverNextAction(employeeId);
+        if (serverAction != 'break-in') {
+          throw Exception("You are not currently on a break.");
+        }
+      }
+      if (type == 'break-out' && onBreak) {
+        final serverAction = await _serverNextAction(employeeId);
+        // A server that says break-in is the next action agrees the employee
+        // is on a break; anything else (including no answer) leaves the local
+        // view standing.
+        if (serverAction == null || serverAction == 'break-in') {
+          throw Exception("You are already on a break. Punch back in first.");
+        }
+      }
+      if (type == 'break-out') {
+        final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
+        final hasTimedOut = await _localDb.hasLogForToday(
+          employeeId,
+          'time-out',
+        );
+        if (!hasTimedIn || hasTimedOut) {
+          throw Exception("You have to be timed in to take a break.");
+        }
+      }
+    }
 
     if (type == 'time-in') {
       final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');

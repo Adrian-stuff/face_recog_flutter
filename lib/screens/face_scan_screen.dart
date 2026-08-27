@@ -59,7 +59,10 @@ class _FaceScanScreenState extends State<FaceScanScreen>
 
   // Next-action state, resolved when an employee is selected so the card badge
   // and action buttons can show context before any scan.
-  String? _nextAction; // 'time-in'|'time-out'|'overtime-in'|'overtime-out'|'done'
+  String? _nextAction; // 'time-in'|'time-out'|'break-out'|'break-in'|'overtime-in'|'overtime-out'|'done'
+  // Punches that are *also* valid right now. Mid-shift there are genuinely
+  // two — go on break, or go home — and _nextAction can only carry one.
+  List<String> _alsoAllowed = const [];
   bool _isLoadingNextAction = false;
   // Whether _nextAction came from the server (which sees every kiosk and any
   // overtime still open from yesterday) or was estimated from this device's
@@ -242,6 +245,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
     setState(() {
       _selectedEmployee = employee;
       _nextAction = null; // reset while loading
+      _alsoAllowed = const [];
       _nextActionIsAuthoritative = false;
     });
     _loadNextAction(employee['id'] as int);
@@ -261,6 +265,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
     if (mounted) {
       setState(() {
         _nextAction = result.action;
+        _alsoAllowed = result.alsoAllowed;
         _nextActionIsAuthoritative = result.authoritative;
         _isLoadingNextAction = false;
       });
@@ -564,6 +569,7 @@ class _FaceScanScreenState extends State<FaceScanScreen>
           setState(() {
             _selectedEmployee = null;
             _nextAction = null;
+            _alsoAllowed = const [];
             _nextActionIsAuthoritative = false;
           });
         }
@@ -1026,11 +1032,66 @@ class _FaceScanScreenState extends State<FaceScanScreen>
         );
 
       case 'time-out':
+        // Mid-shift the employee can go on break or go home, and both are
+        // legitimate. TIME OUT keeps the full width because it is the one
+        // that ends the day; START BREAK sits beside it rather than above,
+        // so the muscle memory for timing out does not move.
+        if (_alsoAllowed.contains('break-out')) {
+          return Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: _buildActionButton(
+                  label: 'TIME OUT',
+                  color: KioskColors.warning,
+                  icon: Icons.logout,
+                  onPressed: _isProcessing
+                      ? null
+                      : () => _recordAttendance('time-out'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                flex: 2,
+                child: _buildActionButton(
+                  label: 'START BREAK',
+                  color: const Color(0xFF6A4CB8),
+                  // wb_sunny reads as midday. There is no coffee cup in the
+                  // 84 glyphs release 1.2.0+67 bundles, and a patch carries
+                  // no assets — an icon outside that set is an empty box on
+                  // every kiosk while looking correct locally.
+                  icon: Icons.wb_sunny,
+                  onPressed: _isProcessing
+                      ? null
+                      : () => _recordAttendance('break-out'),
+                ),
+              ),
+            ],
+          );
+        }
         return _buildActionButton(
           label: 'TIME OUT',
           color: KioskColors.warning,
           icon: Icons.logout,
           onPressed: _isProcessing ? null : () => _recordAttendance('time-out'),
+        );
+
+      case 'break-out':
+        return _buildActionButton(
+          label: 'START BREAK',
+          color: const Color(0xFF6A4CB8),
+          icon: Icons.wb_sunny,
+          onPressed: _isProcessing
+              ? null
+              : () => _recordAttendance('break-out'),
+        );
+
+      case 'break-in':
+        return _buildActionButton(
+          label: 'BACK FROM BREAK',
+          color: KioskColors.success,
+          icon: Icons.login_rounded,
+          onPressed: _isProcessing ? null : () => _recordAttendance('break-in'),
         );
 
       case 'overtime-in':

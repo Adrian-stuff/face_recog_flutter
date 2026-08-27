@@ -857,6 +857,41 @@ class LocalDatabaseService {
     return result.any((row) => _isLocalToday(row['timestamp']));
   }
 
+  /// How many punches of [type] this device recorded for [employeeId] today.
+  ///
+  /// [hasLogForToday] answers the same question as a yes/no, which is enough
+  /// for time-in and time-out — there is at most one of each a day, enforced
+  /// by a unique index server-side. Breaks are the exception: an employee can
+  /// take several, so "are they on a break right now" is a comparison of two
+  /// counts, not two booleans.
+  Future<int> countLogsForToday(int employeeId, String type) async {
+    final db = await database;
+    final (windowStart, windowEnd) = _todayScanWindow();
+
+    final result = await db.query(
+      'attendance_logs',
+      columns: ['timestamp'],
+      where:
+          'employee_id = ? AND type = ? AND timestamp >= ? AND timestamp < ? AND sync_error IS NULL',
+      whereArgs: [employeeId, type, windowStart, windowEnd],
+    );
+
+    return result.where((row) => _isLocalToday(row['timestamp'])).length;
+  }
+
+  /// Whether this device believes [employeeId] is on a break right now.
+  ///
+  /// A break that was punched out of but not back into leaves one more
+  /// break-out than break-in. Counting rather than comparing the newest two
+  /// rows keeps this correct when a punch failed to sync and was excluded —
+  /// the count simply falls, and the worst case is offering a punch the
+  /// server then decides on.
+  Future<bool> isOnBreakToday(int employeeId) async {
+    final out = await countLogsForToday(employeeId, 'break-out');
+    final back = await countLogsForToday(employeeId, 'break-in');
+    return out > back;
+  }
+
   /// Every attendance punch recorded on this device today, newest first,
   /// with the employee's name attached — what the kiosk shows an employee
   /// who wants to see who's clocked in/out so far today.
