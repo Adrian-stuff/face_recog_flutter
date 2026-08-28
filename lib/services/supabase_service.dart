@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import '../utils/punch_rules.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 
@@ -1549,42 +1550,7 @@ class SupabaseService {
     // on an estimate, or an offline kiosk would refuse to let a real employee
     // clock out.
     try {
-      // A break still open outranks everything else, including a time-out:
-      // ending the shift with the break running leaves a session nobody
-      // closed, which payroll then has to fall back to the roster for.
-      if (await _localDb.isOnBreakToday(employeeId)) {
-        return (
-          action: 'break-in',
-          alsoAllowed: const <String>[],
-          authoritative: await _mayTrustLocalHistory(employeeId, _todayKey()),
-        );
-      }
-
-      final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
-      final hasTimedOut = await _localDb.hasLogForToday(employeeId, 'time-out');
-
-      String action;
-      var alsoAllowed = const <String>[];
-      if (!hasTimedIn) {
-        action = 'time-in';
-      } else if (!hasTimedOut) {
-        action = 'time-out';
-        alsoAllowed = const <String>['break-out'];
-      } else {
-        // Completed regular shift — check overtime state
-        final hasOvertimeIn =
-            await _localDb.hasLogForToday(employeeId, 'overtime-in');
-        final hasOvertimeOut =
-            await _localDb.hasLogForToday(employeeId, 'overtime-out');
-
-        if (!hasOvertimeIn) {
-          action = 'overtime-in';
-        } else if (!hasOvertimeOut) {
-          action = 'overtime-out';
-        } else {
-          action = 'done';
-        }
-      }
+      final state = localNextPunch(await _readLocalHistory(employeeId));
 
       // Normally an estimate, and marked as one. It is promoted to
       // authoritative only when the server has said this kiosk is the sole
@@ -1593,14 +1559,39 @@ class SupabaseService {
       // ordinary case, so the buttons stay narrow through an outage instead
       // of falling back to offering everything.
       return (
-        action: action,
-        alsoAllowed: alsoAllowed,
+        action: state.action,
+        alsoAllowed: state.alsoAllowed,
         authoritative: await _mayTrustLocalHistory(employeeId, _todayKey()),
       );
     } catch (e) {
       debugPrint('getEmployeeNextAction: local DB error: $e');
       return (action: null, alsoAllowed: const <String>[], authoritative: false);
     }
+  }
+
+  /// This device's view of what the employee has punched today.
+  ///
+  /// Only the counts the decision actually needs: the overtime pair is read
+  /// lazily, since it is irrelevant until the regular shift is closed and
+  /// each read is a query.
+  Future<LocalPunchHistory> _readLocalHistory(int employeeId) async {
+    final onBreak = await _localDb.isOnBreakToday(employeeId);
+    if (onBreak) return const LocalPunchHistory(onBreak: true);
+
+    final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
+    if (!hasTimedIn) return const LocalPunchHistory();
+
+    final hasTimedOut = await _localDb.hasLogForToday(employeeId, 'time-out');
+    if (!hasTimedOut) {
+      return const LocalPunchHistory(hasTimedIn: true);
+    }
+
+    return LocalPunchHistory(
+      hasTimedIn: true,
+      hasTimedOut: true,
+      hasOvertimeIn: await _localDb.hasLogForToday(employeeId, 'overtime-in'),
+      hasOvertimeOut: await _localDb.hasLogForToday(employeeId, 'overtime-out'),
+    );
   }
 
   /// Today as the server writes it — Manila wall-clock, YYYY-MM-DD.
@@ -1647,41 +1638,32 @@ class SupabaseService {
     // kiosk with a sentence the employee can act on, rather than as a queued
     // punch that is rejected minutes later with nobody watching.
     if (type == 'break-out' || type == 'break-in') {
-      final onBreak = await _localDb.isOnBreakToday(employeeId);
+      final history = await _readLocalHistory(employeeId);
 
-      // Local history is only this device's view, and it is wrong in exactly
-      // the case that matters: isOnBreakToday() counts rows with no
-      // sync_error, so one rejected break-out upload erases the session from
-      // the device's memory while the server keeps it open. Refusing on that
-      // basis would lock the employee out of ending their own break — which
-      // is the overtime bug this codebase already paid for once (see the
-      // overtime-out branch below). So a disagreement asks the server before
-      // it refuses, and only an *offline* device refuses on local state
-      // alone, where there is nothing better to go on.
-      if (type == 'break-in' && !onBreak) {
-        final serverAction = await _serverNextAction(employeeId);
-        if (serverAction != 'break-in') {
-          throw Exception("You are not currently on a break.");
-        }
-      }
-      if (type == 'break-out' && onBreak) {
-        final serverAction = await _serverNextAction(employeeId);
-        // A server that says break-in is the next action agrees the employee
-        // is on a break; anything else (including no answer) leaves the local
-        // view standing.
-        if (serverAction == null || serverAction == 'break-in') {
-          throw Exception("You are already on a break. Punch back in first.");
-        }
-      }
-      if (type == 'break-out') {
-        final hasTimedIn = await _localDb.hasLogForToday(employeeId, 'time-in');
-        final hasTimedOut = await _localDb.hasLogForToday(
-          employeeId,
-          'time-out',
-        );
-        if (!hasTimedIn || hasTimedOut) {
-          throw Exception("You have to be timed in to take a break.");
-        }
+      switch (breakGuardFor(type, history)) {
+        case BreakGuardVerdict.refuse:
+          throw Exception(breakRefusalMessage(type, history));
+
+        case BreakGuardVerdict.askServer:
+          // Local history is only this device's view, and it is wrong in
+          // exactly the case that matters: isOnBreakToday() counts rows with
+          // no sync_error, so one rejected break-out upload erases the
+          // session from the device's memory while the server keeps it open.
+          // Refusing on that basis would lock the employee out of ending
+          // their own break — the overtime bug this codebase already paid for
+          // once (see the overtime-out branch below).
+          final serverAction = await _serverNextAction(employeeId);
+          final serverSaysOnBreak = serverAction == 'break-in';
+          // The server agreeing with local means the refusal stands. For a
+          // break-out, no answer at all also leaves the local view standing —
+          // an offline device has nothing better to go on.
+          final refuse = type == 'break-in'
+              ? !serverSaysOnBreak
+              : (serverAction == null || serverSaysOnBreak);
+          if (refuse) throw Exception(breakRefusalMessage(type, history));
+
+        case BreakGuardVerdict.send:
+          break;
       }
     }
 
