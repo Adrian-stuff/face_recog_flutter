@@ -15,6 +15,7 @@ import '../services/update_service.dart';
 import '../widgets/real_time_clock.dart';
 import '../widgets/roll_call_panel.dart';
 import '../utils/punch_confirmation.dart';
+import '../widgets/punch_button_row.dart';
 import '../widgets/scan_target_bar.dart';
 import '../widgets/status_chip.dart';
 import '../widgets/searchable_employee_selector.dart';
@@ -1011,34 +1012,27 @@ class _FaceScanScreenState extends State<FaceScanScreen>
         // that ends the day; START BREAK sits beside it rather than above,
         // so the muscle memory for timing out does not move.
         if (_alsoAllowed.contains('break-out')) {
-          return Row(
-            children: [
-              Expanded(
-                flex: 3,
-                child: _buildActionButton(
-                  label: 'TIME OUT',
-                  color: KioskColors.warning,
-                  icon: Icons.logout,
-                  onPressed: _isProcessing
-                      ? null
-                      : () => _recordAttendance('time-out'),
-                ),
+          return PunchButtonRow(
+            buttons: [
+              PunchButtonSpec(
+                label: 'TIME OUT',
+                color: KioskColors.warning,
+                icon: Icons.logout,
+                onPressed: _isProcessing
+                    ? null
+                    : () => _recordAttendance('time-out'),
               ),
-              const SizedBox(width: 12),
-              Expanded(
-                flex: 2,
-                child: _buildActionButton(
-                  label: 'START BREAK',
-                  color: const Color(0xFF6A4CB8),
-                  // wb_sunny reads as midday. There is no coffee cup in the
-                  // 84 glyphs release 1.2.0+67 bundles, and a patch carries
-                  // no assets — an icon outside that set is an empty box on
-                  // every kiosk while looking correct locally.
-                  icon: Icons.wb_sunny,
-                  onPressed: _isProcessing
-                      ? null
-                      : () => _recordAttendance('break-out'),
-                ),
+              PunchButtonSpec(
+                label: 'START BREAK',
+                color: const Color(0xFF6A4CB8),
+                // wb_sunny reads as midday. There is no coffee cup in the
+                // 84 glyphs release 1.2.0+67 bundles, and a patch carries
+                // no assets — an icon outside that set is an empty box on
+                // every kiosk while looking correct locally.
+                icon: Icons.wb_sunny,
+                onPressed: _isProcessing
+                    ? null
+                    : () => _recordAttendance('break-out'),
               ),
             ],
           );
@@ -1109,24 +1103,22 @@ class _FaceScanScreenState extends State<FaceScanScreen>
   /// real employee standing at a kiosk with no way to clock out, which is a
   /// far worse failure than showing one button too many.
   Widget _buildBothPunchButtons() {
-    return Row(
-      children: [
-        Expanded(
-          child: _buildActionButton(
-            label: 'TIME IN',
-            color: KioskColors.success,
-            icon: Icons.login,
-            onPressed: _isProcessing ? null : () => _recordAttendance('time-in'),
-          ),
+    return PunchButtonRow(
+      gap: 16,
+      primaryFlex: 1,
+      secondaryFlex: 1,
+      buttons: [
+        PunchButtonSpec(
+          label: 'TIME IN',
+          color: KioskColors.success,
+          icon: Icons.login,
+          onPressed: _isProcessing ? null : () => _recordAttendance('time-in'),
         ),
-        const SizedBox(width: 16),
-        Expanded(
-          child: _buildActionButton(
-            label: 'TIME OUT',
-            color: KioskColors.warning,
-            icon: Icons.logout,
-            onPressed: _isProcessing ? null : () => _recordAttendance('time-out'),
-          ),
+        PunchButtonSpec(
+          label: 'TIME OUT',
+          color: KioskColors.warning,
+          icon: Icons.logout,
+          onPressed: _isProcessing ? null : () => _recordAttendance('time-out'),
         ),
       ],
     );
