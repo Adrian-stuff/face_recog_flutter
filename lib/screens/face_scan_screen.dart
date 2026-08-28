@@ -14,6 +14,7 @@ import '../services/supabase_service.dart';
 import '../services/update_service.dart';
 import '../widgets/real_time_clock.dart';
 import '../widgets/roll_call_panel.dart';
+import '../utils/punch_confirmation.dart';
 import '../widgets/scan_target_bar.dart';
 import '../widgets/status_chip.dart';
 import '../widgets/searchable_employee_selector.dart';
@@ -498,51 +499,24 @@ class _FaceScanScreenState extends State<FaceScanScreen>
       // outcome is even worth attempting.
       final recordedOffline = !await _supabaseService.isOnline;
 
-      // Play Success Sound — use the real effectiveType so TTS says the
-      // correct action (e.g. "Overtime In recorded" not "Time In recorded").
-      final ttsMessage = switch (effectiveType) {
-        'overtime-in' => 'Overtime In recorded for $firstName $lastName',
-        'overtime-out' => 'Overtime Out recorded for $firstName $lastName',
-        'time-in' => 'Time In recorded for $firstName $lastName',
-        _ => 'Time Out recorded for $firstName $lastName',
-      };
-      await _soundService.playSuccess(message: ttsMessage);
+      // One place names every punch type for the confirmation flow — see
+      // punch_confirmation.dart for why this used to be three separate
+      // switches that could (and did) drift out of sync with the buttons.
+      final confirmation = punchConfirmationFor(
+        effectiveType,
+        '$firstName $lastName',
+      );
+      await _soundService.playSuccess(message: confirmation.announcement);
 
       if (mounted) {
         final now = DateTime.now();
         final timeString =
             "${now.hour > 12 ? now.hour - 12 : (now.hour == 0 ? 12 : now.hour)}:${now.minute.toString().padLeft(2, '0')} ${now.hour >= 12 ? 'PM' : 'AM'}";
 
-        // Resolve display labels from the effective type
-        final (dialogTitle, dialogIcon, dialogColor) = switch (effectiveType) {
-          'overtime-in' => (
-              'Overtime Started!',
-              Icons.more_time_rounded,
-              const Color(0xFF00897B), // teal
-            ),
-          'overtime-out' => (
-              'Overtime Ended!',
-              Icons.timelapse_rounded,
-              const Color(0xFFE65100), // deep-orange
-            ),
-          'time-in' => (
-              'Time In Recorded!',
-              Icons.check_circle_rounded,
-              KioskColors.success,
-            ),
-          _ => (
-              'Time Out Recorded!',
-              Icons.check_circle_rounded,
-              KioskColors.success,
-            ),
-        };
-
-        // Extra subtitle for overtime actions
-        final overtimeSubtitle = switch (effectiveType) {
-          'overtime-in' => 'Overtime session has started.',
-          'overtime-out' => 'Overtime session has ended.',
-          _ => null,
-        };
+        final dialogTitle = confirmation.title;
+        final dialogIcon = confirmation.icon;
+        final dialogColor = confirmation.color;
+        final overtimeSubtitle = confirmation.subtitle;
 
         // Show success dialog — reports the real sync outcome (confirmed by
         // server / still offline / still syncing) rather than assuming the
